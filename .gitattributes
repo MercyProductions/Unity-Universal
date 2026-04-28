@@ -1,0 +1,17 @@
+* text=auto
+
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+*.filters text eol=crlf
+*.cpp text eol=crlf
+*.c text eol=crlf
+*.h text eol=crlf
+*.hpp text eol=crlf
+*.rc text eol=crlf
+*.def text eol=crlf
+
+"Aegis Unity Universal/Libraries/imgui/**" linguist-vendored
+"Aegis Unity Universal/Libraries/kiero/**" linguist-vendored
+"Aegis Unity Universal/Libraries/Il2cpp_Resolver/**" linguist-vendored
+"Aegis Unity Universal/Libraries/Mono_Resolver/**" linguist-vendored
+"Aegis Unity Universal/DumpedFiles/**" linguist-generated
