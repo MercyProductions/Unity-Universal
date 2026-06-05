@@ -247,7 +247,13 @@ For Mono, provide the Mono object/vtable pointer for the component when you know
 
 For IL2CPP, provide an `Il2CppClass*` or object-header class pointer when you already know it. The external can also attempt a read-only class-name scan: it searches readable process memory for class-name strings, finds candidate `Il2CppClass::name` references, validates the namespace when a fully qualified name is used, and then scans for live objects whose first pointer matches the candidate class pointer. The default x64 `Il2CppClass::name` and `Il2CppClass::namespaze` offsets are `0x10` and `0x18`; both are configurable in the Developer tab for Unity-version/layout differences.
 
+For Mono, the external can also attempt read-only `MonoClass`/`MonoVTable` discovery by class name. This lets common UnityEngine components such as `UnityEngine.Rigidbody` populate the cache without manually pasting a vtable pointer. The default `MonoClass` name/namespace offsets are `0x30` and `0x38`, and the default `MonoVTable` class pointer offset is `0x0`; these are configurable in Developer for layout differences.
+
 Cached runtime objects can feed the Visual tab. Set `Entity Source` to `Object cache`, configure the position extraction mode/offsets, provide the view-projection matrix address, and enable ESP boxes/snaplines. The overlay re-reads cached object positions every frame before world-to-screen, so boxes can move with the objects once the offsets are correct.
+
+If object cache entries exist but no view-projection matrix is configured, the overlay draws clearly labeled debug snaplines. Those lines only prove that the cache is active; real boxes/snaplines at the object's game position still require a valid matrix plus correct position extraction mode/offsets.
+
+The `Auto probe object/native Vec3` position mode is a read-only helper for early testing. It starts from the managed object's `m_CachedPtr`, rejects nearby metadata-looking pointers, and probes nearby native fields plus one-hop native pointers for plausible `Vector3` values. This is useful for confirming the cache can drive overlay lines, but a game-specific Transform/position offset is still the most reliable setup for exact world placement.
 
 Object-cache position modes:
 
@@ -257,9 +263,21 @@ Pointer field -> Vec3
 m_CachedPtr -> native Vec3
 m_CachedPtr -> native Transform ptr -> Vec3
 Reference field -> m_CachedPtr -> native Vec3
+Auto probe object/native Vec3
 ```
 
 The default `m_CachedPtr` offset is `0x10`, which matches the common x64 managed object header plus the first inherited `UnityEngine.Object` field layout. Native Rigidbody/Transform position offsets are Unity-version and game-layout dependent, so those remain configurable.
+
+The default object-cache scan target is 32 results so startup and diagnostics stay responsive. Increase `Max Results` in Developer only when you need a deeper scan and are comfortable with a slower full-process pass.
+
+You can test object-cache discovery from the console without opening the GUI:
+
+```powershell
+.\build\external\AegisUnityUniversalExternal.exe --exe Muck.exe --object-cache UnityEngine.Rigidbody
+.\build\external\AegisUnityUniversalExternal.exe --exe "MyGame.exe" --object-cache CharacterVisualController --fallback PlayerVisualController
+```
+
+Use the exact component class name from your build. If a requested IL2CPP name is not present in metadata, try the name shown by your own dump/internal tools or use the fallback field. For Stumble Guys-style builds where `CharacterVisualController` is not present by that exact name, the external also tries `PlayerVisualController` and `FallGirlVisualController` as read-only IL2CPP visual-controller aliases.
 
 Use the internal DLL when you need full runtime interaction or actual in-process IL2CPP/Mono calls. Use the external tool when you want read-only process diagnostics without running code inside the game process.
 

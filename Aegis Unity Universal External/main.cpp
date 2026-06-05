@@ -409,7 +409,8 @@ namespace
             << L"  AegisUnityUniversalExternal.exe --exe <game.exe>\n"
             << L"  AegisUnityUniversalExternal.exe --watch\n"
             << L"  AegisUnityUniversalExternal.exe --exe <game.exe> --api il2cpp_class_get_method_from_name\n"
-            << L"  AegisUnityUniversalExternal.exe --exe <game.exe> --map methods.txt --resolve UnityEngine.Time get_timeScale 0\n\n"
+            << L"  AegisUnityUniversalExternal.exe --exe <game.exe> --map methods.txt --resolve UnityEngine.Time get_timeScale 0\n"
+            << L"  AegisUnityUniversalExternal.exe --exe <game.exe> --object-cache UnityEngine.Rigidbody\n\n"
             << L"No-args launch opens the external GUI. Use --console for the interactive console flow.\n\n"
             << L"Method map entries can use any of these forms:\n"
             << L"  image|Namespace.Type|Method|argc|0xRVA\n"
@@ -1640,9 +1641,11 @@ namespace
     {
         const std::optional<std::wstring> apiExport = GetOptionValue(argc, argv, L"--api");
         const std::optional<MethodQuery> methodQuery = ParseMethodQuery(argc, argv);
+        const std::optional<std::wstring> objectCacheComponent = GetOptionValue(argc, argv, L"--object-cache");
+        const std::optional<std::wstring> objectCacheFallback = GetOptionValue(argc, argv, L"--fallback");
         TargetSelection target = ParseTargetSelection(argc, argv);
 
-        if ((apiExport || methodQuery) && !target.pid && !target.executable)
+        if ((apiExport || methodQuery || objectCacheComponent) && !target.pid && !target.executable)
         {
             target = ReadTargetFromConsole();
             if (!target.pid && !target.executable)
@@ -1650,6 +1653,30 @@ namespace
                 std::wcout << L"No target was provided.\n";
                 return 1;
             }
+        }
+
+        if (objectCacheComponent)
+        {
+            std::wstring diagnosticTarget;
+            if (target.pid)
+            {
+                diagnosticTarget = std::to_wstring(*target.pid);
+            }
+            else if (target.executable)
+            {
+                diagnosticTarget = *target.executable;
+            }
+
+            if (diagnosticTarget.empty())
+            {
+                std::wcout << L"No target was provided.\n";
+                return 1;
+            }
+
+            return RunExternalObjectCacheDiagnostic(
+                diagnosticTarget,
+                NarrowUtf8(*objectCacheComponent),
+                objectCacheFallback ? NarrowUtf8(*objectCacheFallback) : std::string{});
         }
 
         if (HasFlag(argc, argv, L"--watch") && !apiExport && !methodQuery)
