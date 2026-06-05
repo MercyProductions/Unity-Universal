@@ -34,6 +34,7 @@ namespace Aegis::UnityExternal
         bool IsOpen() const;
         DWORD ProcessId() const;
         DWORD LastErrorCode() const;
+        HANDLE ProcessHandle() const;
 
         bool ReadRaw(uintptr_t address, void* buffer, std::size_t size, std::size_t* bytesRead = nullptr) const;
         std::vector<std::uint8_t> ReadBytes(uintptr_t address, std::size_t size) const;

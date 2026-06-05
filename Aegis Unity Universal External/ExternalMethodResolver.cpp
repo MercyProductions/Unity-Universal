@@ -72,6 +72,11 @@ namespace Aegis::UnityExternal
             return value;
         }
 
+        std::wstring WidenAscii(const std::string& value)
+        {
+            return std::wstring(value.begin(), value.end());
+        }
+
         std::vector<std::string> Split(const std::string& line, char delimiter)
         {
             std::vector<std::string> parts;
@@ -1130,7 +1135,7 @@ namespace Aegis::UnityExternal
         return entries_;
     }
 
-    std::optional<ResolvedAddress> MethodMap::Find(const MethodQuery& query, const ModuleInfo& module) const
+    std::optional<ResolvedAddress> MethodMap::Find(const MethodQuery& query, const ModuleInfo* module) const
     {
         for (const Entry& entry : entries_)
         {
@@ -1148,11 +1153,46 @@ namespace Aegis::UnityExternal
                 continue;
             }
 
+            if (entry.kind == MethodMapEntryKind::MonoMetadataToken)
+            {
+                return ResolvedAddress{
+                    0,
+                    entry.rva,
+                    entry.metadataToken,
+                    false,
+                    entry.rva != 0,
+                    true,
+                    WidenAscii(entry.imageName),
+                    "mono-metadata",
+                    entry.sourcePath
+                };
+            }
+
+            if (!module)
+            {
+                return ResolvedAddress{
+                    0,
+                    entry.rva,
+                    entry.metadataToken,
+                    false,
+                    true,
+                    entry.metadataToken != 0,
+                    WidenAscii(entry.imageName),
+                    "method-map-rva",
+                    entry.sourcePath
+                };
+            }
+
             return ResolvedAddress{
-                module.base + entry.rva,
+                module->base + entry.rva,
                 entry.rva,
-                module.name,
-                "method-map"
+                entry.metadataToken,
+                true,
+                true,
+                entry.metadataToken != 0,
+                module->name,
+                "method-map",
+                entry.sourcePath
             };
         }
 
@@ -1228,8 +1268,13 @@ namespace Aegis::UnityExternal
         return ResolveResult::Success(ResolvedAddress{
             module.base + found->second,
             found->second,
+            0,
+            true,
+            true,
+            false,
             module.name,
-            "pe-export"
+            "pe-export",
+            {}
         });
     }
 
@@ -1249,7 +1294,7 @@ namespace Aegis::UnityExternal
 
             if (methodMap_ && methodMap_->IsLoaded())
             {
-                std::optional<ResolvedAddress> resolved = methodMap_->Find(query, *modules_.gameAssembly);
+                std::optional<ResolvedAddress> resolved = methodMap_->Find(query, &*modules_.gameAssembly);
                 if (resolved)
                 {
                     return ResolveResult::Success(*resolved);
@@ -1265,9 +1310,20 @@ namespace Aegis::UnityExternal
 
         if (Backend() == RuntimeBackend::Mono)
         {
+            if (methodMap_ && methodMap_->IsLoaded())
+            {
+                std::optional<ResolvedAddress> resolved = methodMap_->Find(query, nullptr);
+                if (resolved)
+                {
+                    return ResolveResult::Success(*resolved);
+                }
+
+                return ResolveResult::Failure("Mono method was not found in the loaded metadata map.");
+            }
+
             return ResolveResult::Failure(
-                "External Mono method resolution is runtime/JIT dependent. "
-                "Use --api to resolve Mono exports, or add a symbol/map source for managed methods.");
+                "External Mono managed method resolution needs a metadata map. "
+                "The startup flow can auto-generate one from the target _Data\\Managed assemblies.");
         }
 
         return ResolveResult::Failure("Unity runtime backend is unknown.");

@@ -10,6 +10,7 @@
 #include "ExternalGui.hpp"
 #include "ExternalIl2CppMapGenerator.hpp"
 #include "ExternalMethodResolver.hpp"
+#include "ExternalMonoMetadataGenerator.hpp"
 #include "ExternalProcess.hpp"
 
 #include <windows.h>
@@ -654,9 +655,27 @@ namespace
     {
         std::wcout << label << L'\n'
             << L"  module : " << resolved.moduleName << L'\n'
-            << L"  source : " << WidenUtf8(resolved.source) << L'\n'
-            << L"  rva    : 0x" << std::hex << std::uppercase << resolved.rva << L'\n'
-            << L"  address: 0x" << std::hex << std::uppercase << resolved.address << std::dec << L'\n';
+            << L"  source : " << WidenUtf8(resolved.source) << L'\n';
+        if (resolved.hasMetadataToken)
+        {
+            std::wcout << L"  token  : 0x" << std::hex << std::uppercase << resolved.metadataToken << std::dec << L'\n';
+        }
+        if (resolved.hasRva)
+        {
+            std::wcout << L"  rva    : 0x" << std::hex << std::uppercase << resolved.rva << std::dec << L'\n';
+        }
+        if (resolved.hasAddress)
+        {
+            std::wcout << L"  address: 0x" << std::hex << std::uppercase << resolved.address << std::dec << L'\n';
+        }
+        else
+        {
+            std::wcout << L"  address: metadata-only; no target-process call was made\n";
+        }
+        if (!resolved.detail.empty())
+        {
+            std::wcout << L"  detail : " << WidenUtf8(resolved.detail) << L'\n';
+        }
     }
 
     int PrintResolveResult(const std::wstring& label, const ResolveResult& result)
@@ -817,7 +836,7 @@ namespace
 
     std::vector<KnownMethod> KnownUnityMethods(RuntimeBackend backend)
     {
-        if (backend != RuntimeBackend::IL2CPP)
+        if (backend == RuntimeBackend::Unknown)
         {
             return {};
         }
@@ -852,7 +871,18 @@ namespace
             std::wcout << L"  " << WidenUtf8(exportName) << L" -> ";
             if (result.value)
             {
-                std::wcout << L"0x" << std::hex << std::uppercase << result.value->address << std::dec;
+                if (result.value->hasAddress)
+                {
+                    std::wcout << L"0x" << std::hex << std::uppercase << result.value->address << std::dec;
+                }
+                else if (result.value->hasMetadataToken)
+                {
+                    std::wcout << L"token 0x" << std::hex << std::uppercase << result.value->metadataToken << std::dec;
+                }
+                else
+                {
+                    std::wcout << L"metadata-only";
+                }
             }
             else
             {
@@ -879,6 +909,14 @@ namespace
             return;
         }
 
+        if (resolver.Backend() == RuntimeBackend::Mono && !resolver.HasMethodMap())
+        {
+            std::wcout
+                << L"\nKnown Unity method presets skipped: no Mono metadata map is loaded.\n"
+                << L"Runtime exports can still resolve directly from the Mono module.\n";
+            return;
+        }
+
         std::wcout << L"\nKnown Unity method map resolutions:\n";
         for (const KnownMethod& method : methods)
         {
@@ -892,7 +930,18 @@ namespace
             std::wcout << L"  " << method.label << L" -> ";
             if (result.value)
             {
-                std::wcout << L"0x" << std::hex << std::uppercase << result.value->address << std::dec;
+                if (result.value->hasAddress)
+                {
+                    std::wcout << L"0x" << std::hex << std::uppercase << result.value->address << std::dec;
+                }
+                else if (result.value->hasMetadataToken)
+                {
+                    std::wcout << L"token 0x" << std::hex << std::uppercase << result.value->metadataToken << std::dec;
+                }
+                else
+                {
+                    std::wcout << L"metadata-only";
+                }
             }
             else
             {
@@ -940,27 +989,52 @@ namespace
         ExternalMethodResolver* resolver,
         std::optional<MethodMap>* loadedMap)
     {
-        if (!resolver || !loadedMap || process.modules.Backend() != RuntimeBackend::IL2CPP)
+        if (!resolver || !loadedMap)
         {
             return false;
         }
 
-        std::wcout << L"\nNo compatible method map file found; attempting IL2CPP metadata auto-generation...\n";
-        GeneratedIl2CppMethodMap generated = GenerateIl2CppMethodMap(process);
-        if (!generated.success)
+        if (process.modules.Backend() == RuntimeBackend::IL2CPP)
         {
-            std::wcout << L"IL2CPP metadata auto-generation failed: " << WidenUtf8(generated.message) << L'\n';
-            return false;
+            std::wcout << L"\nNo compatible method map file found; attempting IL2CPP metadata auto-generation...\n";
+            GeneratedIl2CppMethodMap generated = GenerateIl2CppMethodMap(process);
+            if (!generated.success)
+            {
+                std::wcout << L"IL2CPP metadata auto-generation failed: " << WidenUtf8(generated.message) << L'\n';
+                return false;
+            }
+
+            *loadedMap = generated.methodMap;
+            resolver->SetMethodMap(generated.methodMap);
+            std::wcout
+                << L"Generated IL2CPP method map: " << generated.resolvedMethods << L" entries, "
+                << generated.matchedModules << L"/" << generated.imageCount << L" modules matched\n"
+                << L"Metadata: " << generated.metadataPath.wstring() << L'\n';
+            PrintKnownMethodResolution(*resolver);
+            return true;
         }
 
-        *loadedMap = generated.methodMap;
-        resolver->SetMethodMap(generated.methodMap);
-        std::wcout
-            << L"Generated IL2CPP method map: " << generated.resolvedMethods << L" entries, "
-            << generated.matchedModules << L"/" << generated.imageCount << L" modules matched\n"
-            << L"Metadata: " << generated.metadataPath.wstring() << L'\n';
-        PrintKnownMethodResolution(*resolver);
-        return true;
+        if (process.modules.Backend() == RuntimeBackend::Mono)
+        {
+            std::wcout << L"\nNo compatible method map file found; attempting Mono assembly metadata generation...\n";
+            GeneratedMonoMethodMap generated = GenerateMonoMethodMap(process);
+            if (!generated.success)
+            {
+                std::wcout << L"Mono metadata generation failed: " << WidenUtf8(generated.message) << L'\n';
+                return false;
+            }
+
+            *loadedMap = generated.methodMap;
+            resolver->SetMethodMap(generated.methodMap);
+            std::wcout
+                << L"Generated Mono metadata map: " << generated.methodCount << L" methods, "
+                << generated.typeCount << L" types, " << generated.assemblyCount << L" assemblies\n"
+                << L"Managed folder: " << generated.managedDirectory.wstring() << L'\n';
+            PrintKnownMethodResolution(*resolver);
+            return true;
+        }
+
+        return false;
     }
 
     bool AutoLoadMethodMap(

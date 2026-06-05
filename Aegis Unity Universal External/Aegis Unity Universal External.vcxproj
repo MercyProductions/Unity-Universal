@@ -161,6 +161,7 @@
     <ClCompile Include="ExternalIl2CppMapGenerator.cpp" />
     <ClCompile Include="ExternalMemory.cpp" />
     <ClCompile Include="ExternalMethodResolver.cpp" />
+    <ClCompile Include="ExternalMonoMetadataGenerator.cpp" />
     <ClCompile Include="ExternalProcess.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
@@ -173,6 +174,7 @@
     <ClInclude Include="ExternalIl2CppMapGenerator.hpp" />
     <ClInclude Include="ExternalMemory.hpp" />
     <ClInclude Include="ExternalMethodResolver.hpp" />
+    <ClInclude Include="ExternalMonoMetadataGenerator.hpp" />
     <ClInclude Include="ExternalProcess.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -12,15 +12,15 @@ The internal and external builds share the same goal: make Unity runtime inspect
 | Capability | Internal DLL | External Prototype |
 | --- | --- | --- |
 | Build target | `AegisUnityUniversalInternal.dll` | `AegisUnityUniversalExternal.exe` |
-| Runtime support | IL2CPP and Mono | IL2CPP and Mono detection; IL2CPP method-map support; Mono export diagnostics |
+| Runtime support | IL2CPP and Mono | IL2CPP and Mono detection; IL2CPP method-map support; Mono assembly metadata maps |
 | Runs inside game process | Yes | No |
 | Injection required | Yes, by design | No |
 | Game render hook | D3D11/OpenGL ImGui overlay | No game hook; own transparent ImGui desktop window |
 | Unity managed calls | Yes, in-process | No direct managed calls |
 | Runtime export resolver | Yes | Yes |
 | IL2CPP method resolving | Yes, plus generated/internal SDK data when available | Yes, from maps/dumps or auto-generated metadata map |
-| Mono method resolving | Yes, through the internal Mono runtime helpers | Prototype-level externally: Mono module/export visibility and read-only diagnostics |
-| Object/GameObject cache | Yes | Not automatic yet; external visual features need user-supplied offsets |
+| Mono method resolving | Yes, through the internal Mono runtime helpers | Yes for metadata identity from `_Data\Managed` assemblies; no target-process invocation |
+| Object/GameObject cache | Yes | Offset-driven visuals plus a read-only Mono object/vtable pointer candidate cache |
 | ESP/radar/crosshair | In-game overlay path | Offset-driven external overlay path |
 | Lua | Yes, internal process scripting surface | No |
 | Memory writes/patches | Internal features can modify in-process state | No; external memory access is read-only |
@@ -218,15 +218,30 @@ UnityEngine.Transform::get_position
 
 ## External Mono Support
 
-Mono support in the external prototype is currently diagnostic-focused. The tool can detect Mono Unity targets, find Mono runtime modules, resolve Mono exports, run process/module scans, perform read-only memory reads, run module-scoped AOB scans, and maintain typed watch rows.
+Mono support in the external prototype now has a real read-only metadata path. The tool can detect Mono Unity targets, find Mono runtime modules, resolve Mono exports, run process/module scans, perform read-only memory reads, run module-scoped AOB scans, maintain typed watch rows, and auto-generate a managed method metadata map from the target game's managed assemblies.
 
-What is not finished externally for Mono:
+When no compatible method map file exists for a Mono target, startup searches for:
 
-- Automatic managed Mono method map generation.
-- Direct managed Mono method invocation.
-- Live external Mono object cache.
+```text
+<GameName>_Data\Managed
+```
 
-Use the internal DLL when you need full Mono runtime interaction. Use the external tool when you want read-only process diagnostics without running code inside the game process.
+It parses the managed `.dll` files directly, reads ECMA-335 metadata tables, and builds an in-memory map of:
+
+```text
+Assembly image
+Namespace.Type
+Method
+Argument count
+MethodDef metadata token
+IL RVA when present
+```
+
+Mono method resolution therefore returns a metadata identity, such as `UnityEngine.Time::get_timeScale -> token 0x060014BA`. It does not pretend that token is a callable native address. Normal Mono JIT/native addresses are runtime-dependent and require code running inside the target to compile or invoke methods.
+
+The Developer tab also includes a read-only Mono object cache scanner. Provide a Mono object/vtable pointer, then refresh the cache. The scanner walks committed readable private/mapped memory with `VirtualQueryEx` and caches addresses whose first pointer-sized field matches the supplied value. This gives you a live external candidate list without injection or writes, but it still needs a known pointer from your own diagnostics, symbols, logs, or internal testing.
+
+Use the internal DLL when you need full Mono runtime interaction or actual managed calls. Use the external tool when you want read-only process diagnostics without running code inside the game process.
 
 ## External Visuals, ESP, And Radar
 
@@ -252,9 +267,10 @@ The external tool stays out-of-process:
 2. It opens the chosen target with query/read access.
 3. It detects Unity runtime modules such as `UnityPlayer.dll`, `GameAssembly.dll`, and Mono DLLs.
 4. It resolves native runtime exports by parsing module export tables.
-5. It loads method RVAs from maps/dumps, or tries to generate an IL2CPP map from metadata.
-6. It turns method RVAs into live addresses using the target module base.
-7. It exposes read-only diagnostics, AOB scanning, typed memory reads, method browsing, and offset-driven visuals in ImGui.
+5. It loads method RVAs from maps/dumps, generates an IL2CPP map from metadata, or generates a Mono metadata map from managed assemblies.
+6. For IL2CPP/native maps, it turns RVAs into live addresses using the target module base.
+7. For Mono metadata maps, it reports MethodDef tokens and IL RVAs as metadata identities.
+8. It exposes read-only diagnostics, AOB scanning, typed memory reads, method browsing, a Mono pointer-scanned object cache, and offset-driven visuals in ImGui.
 
 The external project intentionally does not inject, hook the game renderer, call managed methods, patch code, or write memory. It is meant for authorized read-only inspection and prototype overlay work.
 
@@ -265,11 +281,12 @@ For a game you own or are authorized to inspect:
 1. Build the internal and external projects in `Release|x64`.
 2. For internal testing, configure `PlayerComponentName` to your real player component.
 3. For IL2CPP projects, keep `global-metadata.dat` and `GameAssembly.dll` available beside the target, or export `script.json`/`dump.cs` with your preferred Unity dump tool.
-4. Start the game, then launch the external executable and type the process exe name.
-5. Confirm the console reports the expected runtime, module addresses, and method-map status.
-6. Use the external Developer and Universal tabs to inspect exports, method maps, process modules, AOB scans, and read-only memory values.
-7. Use internal component/object diagnostics when you need to discover the exact component name or GameObject relationship.
-8. Use external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
+4. For Mono projects, keep the normal `<GameName>_Data\Managed` folder beside the executable so the external can auto-generate the metadata map.
+5. Start the game, then launch the external executable and type the process exe name.
+6. Confirm the console reports the expected runtime, module addresses, and method-map status.
+7. Use the external Developer and Universal tabs to inspect exports, method maps, process modules, AOB scans, Mono object-cache candidates, and read-only memory values.
+8. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, or Mono object/vtable pointer.
+9. Use external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
 
 For best results, start with a small Unity test scene that has a known `PlayerController`, one camera, and a few spawned test objects. Confirm the internal cache sees the component, then move to the external prototype once you know which memory structures you want to read.
 
@@ -282,8 +299,10 @@ For best results, start with a small Unity test scene that has a known `PlayerCo
 - No automatic live Unity GameObject explorer externally yet.
 - No Lua execution externally.
 - No memory writes or patching.
-- Mono method resolution is not complete beyond Mono module/export diagnostics.
+- Direct Mono invocation through `mono_runtime_invoke` remains internal-only because a real call must execute inside the target process.
+- External Mono object caching requires a supplied Mono object/vtable pointer; it is not a full automatic managed heap walker yet.
 - IL2CPP auto-map generation depends on metadata layout and may fail on custom or unsupported Unity builds.
+- Mono metadata-map generation depends on standard managed assembly metadata in `_Data\Managed`.
 - Offset-driven ESP/radar requires game-specific addresses and structure offsets.
 
 ## Repository Notes

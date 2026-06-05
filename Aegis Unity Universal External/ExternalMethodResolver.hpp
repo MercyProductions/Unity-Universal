@@ -10,12 +10,23 @@
 
 namespace Aegis::UnityExternal
 {
+    enum class MethodMapEntryKind
+    {
+        NativeRva,
+        MonoMetadataToken
+    };
+
     struct ResolvedAddress
     {
         uintptr_t address = 0;
         std::uint32_t rva = 0;
+        std::uint32_t metadataToken = 0;
+        bool hasAddress = true;
+        bool hasRva = true;
+        bool hasMetadataToken = false;
         std::wstring moduleName;
         std::string source;
+        std::string detail;
     };
 
     struct ResolveError
@@ -50,6 +61,9 @@ namespace Aegis::UnityExternal
             std::string methodName;
             int argumentCount = -1;
             std::uint32_t rva = 0;
+            std::uint32_t metadataToken = 0;
+            MethodMapEntryKind kind = MethodMapEntryKind::NativeRva;
+            std::string sourcePath;
         };
 
         bool Load(const std::wstring& path, std::string* errorMessage = nullptr);
@@ -57,7 +71,7 @@ namespace Aegis::UnityExternal
         bool IsLoaded() const;
         std::size_t Count() const;
         const std::vector<Entry>& Entries() const;
-        std::optional<ResolvedAddress> Find(const MethodQuery& query, const ModuleInfo& module) const;
+        std::optional<ResolvedAddress> Find(const MethodQuery& query, const ModuleInfo* module) const;
 
     private:
         std::vector<Entry> entries_;

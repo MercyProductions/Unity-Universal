@@ -70,6 +70,11 @@ namespace Aegis::UnityExternal
         return lastError_;
     }
 
+    HANDLE ExternalMemoryReader::ProcessHandle() const
+    {
+        return process_;
+    }
+
     bool ExternalMemoryReader::ReadRaw(uintptr_t address, void* buffer, std::size_t size, std::size_t* bytesRead) const
     {
         if (!process_ || !buffer || size == 0)

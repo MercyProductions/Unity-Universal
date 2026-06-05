@@ -11,6 +11,7 @@
 #include "ExternalIl2CppMapGenerator.hpp"
 #include "ExternalMemory.hpp"
 #include "ExternalMethodResolver.hpp"
+#include "ExternalMonoMetadataGenerator.hpp"
 #include "ExternalProcess.hpp"
 
 #include "../Aegis Unity Universal/Libraries/imgui/imgui.h"
@@ -32,6 +33,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -107,6 +109,12 @@ namespace Aegis::UnityExternal
             ImVec2 head;
         };
 
+        struct MonoObjectCacheEntry
+        {
+            uintptr_t address = 0;
+            uintptr_t matchedPointer = 0;
+        };
+
         struct GuiState
         {
             GuiTab tab = GuiTab::Universal;
@@ -128,6 +136,8 @@ namespace Aegis::UnityExternal
             char scanPattern[260] = "";
             int scanModule = 0;
             char methodFilter[160] = "";
+            char monoObjectPointer[80] = "";
+            int monoObjectMaxResults = 512;
             bool overlayMode = false;
             bool alignToTargetWindow = true;
             bool clickThroughOverlay = false;
@@ -161,6 +171,8 @@ namespace Aegis::UnityExternal
             std::vector<WatchEntry> watches;
             std::vector<ScanResult> scanResults;
             std::vector<EspEntity> espEntities;
+            std::vector<MonoObjectCacheEntry> monoObjectCache;
+            std::string monoObjectCacheStatus;
             std::vector<std::string> log;
         };
 
@@ -363,6 +375,39 @@ namespace Aegis::UnityExternal
             std::ostringstream stream;
             stream << "0x" << std::hex << std::uppercase << value;
             return stream.str();
+        }
+
+        std::string FormatResolvedValue(const ResolvedAddress& resolved)
+        {
+            if (resolved.hasAddress)
+            {
+                return FormatHex(resolved.address);
+            }
+
+            if (resolved.hasMetadataToken)
+            {
+                std::string value = "metadata token " + FormatHex(resolved.metadataToken);
+                if (resolved.hasRva && resolved.rva != 0)
+                {
+                    value += ", IL RVA " + FormatHex(resolved.rva);
+                }
+                return value;
+            }
+
+            return "metadata-only";
+        }
+
+        const char* MethodEntryKindName(MethodMapEntryKind kind)
+        {
+            switch (kind)
+            {
+            case MethodMapEntryKind::NativeRva:
+                return "native-rva";
+            case MethodMapEntryKind::MonoMetadataToken:
+                return "mono-token";
+            default:
+                return "unknown";
+            }
         }
 
         std::string ModuleSummary(const std::optional<ModuleInfo>& module)
@@ -572,6 +617,115 @@ namespace Aegis::UnityExternal
             }
 
             return true;
+        }
+
+        bool IsReadableMemoryProtection(DWORD protect)
+        {
+            if ((protect & PAGE_GUARD) != 0 || (protect & PAGE_NOACCESS) != 0)
+            {
+                return false;
+            }
+
+            const DWORD baseProtect = protect & 0xFF;
+            return baseProtect == PAGE_READONLY ||
+                baseProtect == PAGE_READWRITE ||
+                baseProtect == PAGE_WRITECOPY ||
+                baseProtect == PAGE_EXECUTE_READ ||
+                baseProtect == PAGE_EXECUTE_READWRITE ||
+                baseProtect == PAGE_EXECUTE_WRITECOPY;
+        }
+
+        void RefreshMonoObjectCache(GuiState* state)
+        {
+            if (!state)
+            {
+                return;
+            }
+
+            state->monoObjectCache.clear();
+            state->monoObjectCacheStatus.clear();
+
+            if (!state->process || state->process->modules.Backend() != RuntimeBackend::Mono)
+            {
+                state->monoObjectCacheStatus = "Attach to a Mono target first.";
+                AddLog(state, "Mono object cache scan skipped: target is not Mono.");
+                return;
+            }
+
+            if (!state->reader.IsOpen() || !state->reader.ProcessHandle())
+            {
+                state->monoObjectCacheStatus = "Target memory is not open for reading.";
+                AddLog(state, "Mono object cache scan skipped: no read handle.");
+                return;
+            }
+
+            const std::optional<std::uint64_t> pointer = ParseUnsignedInteger(state->monoObjectPointer);
+            if (!pointer || *pointer == 0)
+            {
+                state->monoObjectCacheStatus = "Type a Mono object/vtable pointer first.";
+                AddLog(state, "Mono object cache scan skipped: no object/vtable pointer.");
+                return;
+            }
+
+            const uintptr_t matchPointer = static_cast<uintptr_t>(*pointer);
+            const std::size_t maxResults = static_cast<std::size_t>(std::clamp(state->monoObjectMaxResults, 1, 4096));
+            constexpr std::size_t kChunkSize = 1024 * 1024;
+
+            uintptr_t address = 0;
+            MEMORY_BASIC_INFORMATION mbi{};
+            while (state->monoObjectCache.size() < maxResults &&
+                VirtualQueryEx(state->reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
+            {
+                const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                const uintptr_t next = base + mbi.RegionSize;
+                if (next <= base)
+                {
+                    break;
+                }
+
+                if (mbi.State == MEM_COMMIT &&
+                    (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED) &&
+                    IsReadableMemoryProtection(mbi.Protect))
+                {
+                    for (uintptr_t chunkBase = base; chunkBase < next && state->monoObjectCache.size() < maxResults;)
+                    {
+                        const std::size_t chunkSize = static_cast<std::size_t>(std::min<std::uint64_t>(kChunkSize, next - chunkBase));
+                        const std::vector<std::uint8_t> bytes = state->reader.ReadBytes(chunkBase, chunkSize);
+                        if (bytes.size() >= sizeof(uintptr_t))
+                        {
+                            for (std::size_t offset = 0; offset + sizeof(uintptr_t) <= bytes.size(); offset += sizeof(uintptr_t))
+                            {
+                                uintptr_t candidate = 0;
+                                std::memcpy(&candidate, bytes.data() + offset, sizeof(candidate));
+                                if (candidate != matchPointer)
+                                {
+                                    continue;
+                                }
+
+                                state->monoObjectCache.push_back(MonoObjectCacheEntry{
+                                    chunkBase + offset,
+                                    candidate
+                                });
+
+                                if (state->monoObjectCache.size() >= maxResults)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+
+                        chunkBase += chunkSize;
+                    }
+                }
+
+                address = next;
+            }
+
+            std::ostringstream status;
+            status << "Cached " << state->monoObjectCache.size()
+                << " live candidate object(s) for pointer " << FormatHex(matchPointer) << ".";
+            state->monoObjectCacheStatus = status.str();
+            AddLog(state, "%s", state->monoObjectCacheStatus.c_str());
         }
 
         std::optional<std::vector<PatternByte>> ParseAobPattern(const std::string& text, std::string* error)
@@ -966,7 +1120,7 @@ namespace Aegis::UnityExternal
 
         std::vector<KnownMethod> KnownUnityMethods(RuntimeBackend backend)
         {
-            if (backend != RuntimeBackend::IL2CPP)
+            if (backend == RuntimeBackend::Unknown)
             {
                 return {};
             }
@@ -1347,7 +1501,7 @@ namespace Aegis::UnityExternal
             const ResolveResult result = state->resolver->ResolveMethod(query);
             if (result.value)
             {
-                AddLog(state, "%s -> %s", label, FormatHex(result.value->address).c_str());
+                AddLog(state, "%s -> %s", label, FormatResolvedValue(*result.value).c_str());
             }
             else
             {
@@ -1413,6 +1567,14 @@ namespace Aegis::UnityExternal
                     return;
                 }
 
+                if (backend == RuntimeBackend::Mono && !state->resolver->HasMethodMap())
+                {
+                    AddLog(
+                        state,
+                        "Mono managed method presets skipped: no metadata map loaded. Runtime exports above are resolved.");
+                    return;
+                }
+
                 AddLog(state, "Startup resolving known Unity method presets...");
                 for (const KnownMethod& method : methods)
                 {
@@ -1425,7 +1587,7 @@ namespace Aegis::UnityExternal
                     const ResolveResult result = state->resolver->ResolveMethod(query);
                     if (result.value)
                     {
-                        AddLog(state, "  method %-42s %s", method.label, FormatHex(result.value->address).c_str());
+                        AddLog(state, "  method %-42s %s", method.label, FormatResolvedValue(*result.value).c_str());
                     }
                     else
                     {
@@ -1437,7 +1599,7 @@ namespace Aegis::UnityExternal
             }
             else if (backend == RuntimeBackend::Mono)
             {
-                AddLog(state, "Mono detected. Managed method addresses require Mono metadata/JIT symbols or a map; runtime exports were resolved above.");
+                AddLog(state, "Mono detected. Managed method metadata can be resolved from the auto-generated assembly map; direct target invocation remains external-only blocked.");
             }
         }
 
@@ -1576,6 +1738,39 @@ namespace Aegis::UnityExternal
             return true;
         }
 
+        bool TryGenerateMonoMethodMap(GuiState* state)
+        {
+            if (!state || !state->process || state->process->modules.Backend() != RuntimeBackend::Mono)
+            {
+                return false;
+            }
+
+            AddLog(state, "No compatible map file found; attempting Mono assembly metadata generation...");
+            GeneratedMonoMethodMap generated = GenerateMonoMethodMap(*state->process);
+            if (!generated.success)
+            {
+                AddLog(state, "Mono metadata generation failed: %s", generated.message.c_str());
+                return false;
+            }
+
+            state->methodMap = generated.methodMap;
+            if (state->resolver)
+            {
+                state->resolver->SetMethodMap(generated.methodMap);
+            }
+
+            const std::string displayPath = "auto:" + WideToUtf8(generated.managedDirectory.wstring());
+            CopyToBuffer(state->methodMapPath, sizeof(state->methodMapPath), displayPath);
+            AddLog(
+                state,
+                "Generated Mono metadata map (%zu methods, %zu types, %zu assemblies): %s",
+                generated.methodCount,
+                generated.typeCount,
+                generated.assemblyCount,
+                WideToUtf8(generated.managedDirectory.wstring()).c_str());
+            return true;
+        }
+
         void AutoLoadStartupMethodMap(GuiState* state)
         {
             if (!state)
@@ -1603,6 +1798,11 @@ namespace Aegis::UnityExternal
             }
 
             if (TryGenerateIl2CppMethodMap(state))
+            {
+                return;
+            }
+
+            if (TryGenerateMonoMethodMap(state))
             {
                 return;
             }
@@ -2259,6 +2459,14 @@ namespace Aegis::UnityExternal
                 LoadMethodMap(state);
             }
             ImGui::SameLine();
+            if (ImGui::Button("Auto Generate"))
+            {
+                if (!TryGenerateIl2CppMethodMap(state) && !TryGenerateMonoMethodMap(state))
+                {
+                    AddLog(state, "No automatic method map generator is available for the current target/runtime.");
+                }
+            }
+            ImGui::SameLine();
             ImGui::Text("Entries: %zu", state->methodMap ? state->methodMap->Count() : 0);
 
             ImGui::InputTextWithHint("Image", "UnityEngine.CoreModule", state->imageName, sizeof(state->imageName));
@@ -2433,19 +2641,59 @@ namespace Aegis::UnityExternal
             DrawProcessTable(state);
             ImGui::Separator();
 
+            ImGui::Text("Mono Object Cache");
+            ImGui::InputTextWithHint("Object/VTable Pointer##MonoObjectPointer", "0x00000000", state->monoObjectPointer, sizeof(state->monoObjectPointer));
+            ImGui::InputInt("Max Results##MonoObjectMax", &state->monoObjectMaxResults);
+            if (ImGui::Button("Refresh Mono Object Cache"))
+            {
+                RefreshMonoObjectCache(state);
+            }
+            if (!state->monoObjectCacheStatus.empty())
+            {
+                ImGui::TextWrapped("%s", state->monoObjectCacheStatus.c_str());
+            }
+            if (ImGui::BeginTable("##MonoObjectCacheTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 110)))
+            {
+                ImGui::TableSetupColumn("Object", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn("Matched Pointer", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableHeadersRow();
+                for (std::size_t index = 0; index < state->monoObjectCache.size(); ++index)
+                {
+                    const MonoObjectCacheEntry& entry = state->monoObjectCache[index];
+                    ImGui::PushID(static_cast<int>(index));
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(FormatHex(entry.address).c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(FormatHex(entry.matchedPointer).c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    if (ImGui::SmallButton("Use"))
+                    {
+                        const std::string address = FormatHex(entry.address);
+                        CopyToBuffer(state->readAddress, sizeof(state->readAddress), address);
+                        CopyToBuffer(state->watchAddress, sizeof(state->watchAddress), address);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::Separator();
+
             ImGui::Text("Method Map Explorer");
             ImGui::InputTextWithHint("Filter##MethodMapFilter", "class / method / image", state->methodFilter, sizeof(state->methodFilter));
             if (!state->methodMap)
             {
                 ImGui::TextDisabled("No method map loaded.");
             }
-            else if (ImGui::BeginTable("##MethodMapExplorer", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 170)))
+            else if (ImGui::BeginTable("##MethodMapExplorer", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 170)))
             {
                 ImGui::TableSetupColumn("Image");
                 ImGui::TableSetupColumn("Class");
                 ImGui::TableSetupColumn("Method");
                 ImGui::TableSetupColumn("Argc", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-                ImGui::TableSetupColumn("RVA", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 85.0f);
+                ImGui::TableSetupColumn("RVA/Token", ImGuiTableColumnFlags_WidthFixed, 110.0f);
                 ImGui::TableSetupColumn("VA", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                 ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 70.0f);
                 ImGui::TableHeadersRow();
@@ -2482,9 +2730,23 @@ namespace Aegis::UnityExternal
                         ImGui::Text("%d", entry.argumentCount);
                     }
                     ImGui::TableSetColumnIndex(4);
-                    ImGui::TextUnformatted(FormatHex(entry.rva).c_str());
+                    ImGui::TextUnformatted(MethodEntryKindName(entry.kind));
                     ImGui::TableSetColumnIndex(5);
-                    if (gameAssemblyBase)
+                    if (entry.kind == MethodMapEntryKind::MonoMetadataToken)
+                    {
+                        ImGui::TextUnformatted(FormatHex(entry.metadataToken).c_str());
+                        if (entry.rva != 0)
+                        {
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("IL %s", FormatHex(entry.rva).c_str());
+                        }
+                    }
+                    else
+                    {
+                        ImGui::TextUnformatted(FormatHex(entry.rva).c_str());
+                    }
+                    ImGui::TableSetColumnIndex(6);
+                    if (entry.kind == MethodMapEntryKind::NativeRva && gameAssemblyBase)
                     {
                         ImGui::TextUnformatted(FormatHex(gameAssemblyBase + entry.rva).c_str());
                     }
@@ -2492,7 +2754,7 @@ namespace Aegis::UnityExternal
                     {
                         ImGui::TextDisabled("n/a");
                     }
-                    ImGui::TableSetColumnIndex(6);
+                    ImGui::TableSetColumnIndex(7);
                     if (ImGui::SmallButton("Use"))
                     {
                         CopyToBuffer(state->imageName, sizeof(state->imageName), entry.imageName);
@@ -2500,7 +2762,7 @@ namespace Aegis::UnityExternal
                         CopyToBuffer(state->methodName, sizeof(state->methodName), entry.methodName);
                         state->argumentCount = entry.argumentCount;
                         state->anyArgumentCount = entry.argumentCount < 0;
-                        if (gameAssemblyBase)
+                        if (entry.kind == MethodMapEntryKind::NativeRva && gameAssemblyBase)
                         {
                             const std::string address = FormatHex(gameAssemblyBase + entry.rva);
                             CopyToBuffer(state->readAddress, sizeof(state->readAddress), address);
