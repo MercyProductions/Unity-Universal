@@ -113,6 +113,10 @@ namespace Aegis::UnityExternal
         {
             uintptr_t address = 0;
             uintptr_t matchedPointer = 0;
+            uintptr_t positionAddress = 0;
+            Vec3 position;
+            bool hasPosition = false;
+            std::string label;
         };
 
         struct GuiState
@@ -136,8 +140,17 @@ namespace Aegis::UnityExternal
             char scanPattern[260] = "";
             int scanModule = 0;
             char methodFilter[160] = "";
+            char objectCacheComponentName[160] = "PlayerController";
+            char objectCacheFallbackComponentName[160] = "UnityEngine.Rigidbody";
             char monoObjectPointer[80] = "";
+            char monoObjectFallbackPointer[80] = "";
             int monoObjectMaxResults = 512;
+            bool objectCacheUseFallback = true;
+            int entitySource = 0;
+            int objectPositionMode = 2;
+            int objectPointerOffset = 0;
+            int objectCachedPtrOffset = 0x10;
+            int objectTransformPointerOffset = 0;
             bool overlayMode = false;
             bool alignToTargetWindow = true;
             bool clickThroughOverlay = false;
@@ -451,6 +464,42 @@ namespace Aegis::UnityExternal
             return value;
         }
 
+        std::string TrimAscii(std::string value)
+        {
+            const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
+                return std::isspace(ch) != 0;
+            });
+            const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char ch) {
+                return std::isspace(ch) != 0;
+            }).base();
+
+            if (first >= last)
+            {
+                return {};
+            }
+
+            return std::string(first, last);
+        }
+
+        bool ClassNameMatches(std::string className, std::string requested)
+        {
+            className = ToLowerAscii(TrimAscii(std::move(className)));
+            requested = ToLowerAscii(TrimAscii(std::move(requested)));
+            if (className.empty() || requested.empty())
+            {
+                return false;
+            }
+
+            if (className == requested)
+            {
+                return true;
+            }
+
+            return className.size() > requested.size() &&
+                className.compare(className.size() - requested.size(), requested.size(), requested) == 0 &&
+                className[className.size() - requested.size() - 1] == '.';
+        }
+
         bool ContainsInsensitiveAscii(const std::string& text, const std::string& needle)
         {
             if (needle.empty())
@@ -480,6 +529,106 @@ namespace Aegis::UnityExternal
             }
 
             *out = *value;
+            return true;
+        }
+
+        uintptr_t OffsetAddress(uintptr_t base, int offset)
+        {
+            if (offset >= 0)
+            {
+                return base + static_cast<uintptr_t>(offset);
+            }
+
+            return base - static_cast<uintptr_t>(-offset);
+        }
+
+        bool ReadObjectCachePosition(
+            const GuiState& state,
+            uintptr_t objectAddress,
+            Vec3* position,
+            uintptr_t* positionAddress)
+        {
+            if (!position || !positionAddress || objectAddress == 0 || !state.reader.IsOpen())
+            {
+                return false;
+            }
+
+            uintptr_t readAddress = 0;
+            switch (state.objectPositionMode)
+            {
+            case 0:
+                readAddress = OffsetAddress(objectAddress, state.positionOffset);
+                break;
+            case 1:
+            {
+                const std::optional<uintptr_t> pointer =
+                    state.reader.Read<uintptr_t>(OffsetAddress(objectAddress, state.objectPointerOffset));
+                if (!pointer || *pointer == 0)
+                {
+                    return false;
+                }
+                readAddress = OffsetAddress(*pointer, state.positionOffset);
+                break;
+            }
+            case 2:
+            {
+                const std::optional<uintptr_t> nativePointer =
+                    state.reader.Read<uintptr_t>(OffsetAddress(objectAddress, state.objectCachedPtrOffset));
+                if (!nativePointer || *nativePointer == 0)
+                {
+                    return false;
+                }
+                readAddress = OffsetAddress(*nativePointer, state.positionOffset);
+                break;
+            }
+            case 3:
+            {
+                const std::optional<uintptr_t> nativePointer =
+                    state.reader.Read<uintptr_t>(OffsetAddress(objectAddress, state.objectCachedPtrOffset));
+                if (!nativePointer || *nativePointer == 0)
+                {
+                    return false;
+                }
+
+                const std::optional<uintptr_t> transformPointer =
+                    state.reader.Read<uintptr_t>(OffsetAddress(*nativePointer, state.objectTransformPointerOffset));
+                if (!transformPointer || *transformPointer == 0)
+                {
+                    return false;
+                }
+                readAddress = OffsetAddress(*transformPointer, state.positionOffset);
+                break;
+            }
+            case 4:
+            {
+                const std::optional<uintptr_t> componentObject =
+                    state.reader.Read<uintptr_t>(OffsetAddress(objectAddress, state.objectPointerOffset));
+                if (!componentObject || *componentObject == 0)
+                {
+                    return false;
+                }
+
+                const std::optional<uintptr_t> nativePointer =
+                    state.reader.Read<uintptr_t>(OffsetAddress(*componentObject, state.objectCachedPtrOffset));
+                if (!nativePointer || *nativePointer == 0)
+                {
+                    return false;
+                }
+                readAddress = OffsetAddress(*nativePointer, state.positionOffset);
+                break;
+            }
+            default:
+                return false;
+            }
+
+            Vec3 value{};
+            if (!ReadVec3(state.reader, readAddress, &value))
+            {
+                return false;
+            }
+
+            *position = value;
+            *positionAddress = readAddress;
             return true;
         }
 
@@ -560,6 +709,29 @@ namespace Aegis::UnityExternal
                 return false;
             }
 
+            state->espEntities.clear();
+            if (state->entitySource == 1)
+            {
+                state->espEntities.reserve(state->monoObjectCache.size());
+                for (MonoObjectCacheEntry& cached : state->monoObjectCache)
+                {
+                    cached.hasPosition = ReadObjectCachePosition(*state, cached.address, &cached.position, &cached.positionAddress);
+                    if (!cached.hasPosition)
+                    {
+                        continue;
+                    }
+
+                    EspEntity entity;
+                    entity.address = cached.address;
+                    entity.position = cached.position;
+                    entity.onScreen = WorldToScreen(cached.position, matrix, state->matrixLayout, screenSize, &entity.screen);
+                    entity.onScreen = WorldToScreen(EntityHeadPosition(cached.position, state->upAxis, state->entityHeight), matrix, state->matrixLayout, screenSize, &entity.head)
+                        && entity.onScreen;
+                    state->espEntities.push_back(entity);
+                }
+                return !state->espEntities.empty();
+            }
+
             const std::optional<std::uint64_t> listAddress = ParseUnsignedInteger(state->entityListAddress);
             if (!listAddress)
             {
@@ -579,7 +751,6 @@ namespace Aegis::UnityExternal
                 }
             }
 
-            state->espEntities.clear();
             state->espEntities.reserve(static_cast<std::size_t>(std::min(count, 256)));
 
             for (int index = 0; index < count; ++index)
@@ -602,7 +773,7 @@ namespace Aegis::UnityExternal
                 }
 
                 Vec3 position;
-                if (!ReadVec3(state->reader, entityAddress + static_cast<std::ptrdiff_t>(state->positionOffset), &position))
+                if (!ReadVec3(state->reader, OffsetAddress(entityAddress, state->positionOffset), &position))
                 {
                     continue;
                 }
@@ -635,6 +806,46 @@ namespace Aegis::UnityExternal
                 baseProtect == PAGE_EXECUTE_WRITECOPY;
         }
 
+        std::string ComponentMetadataSummary(const GuiState& state, const std::string& componentName)
+        {
+            if (!state.methodMap || componentName.empty())
+            {
+                return {};
+            }
+
+            std::size_t methodCount = 0;
+            std::string firstImage;
+            std::string firstClass;
+            for (const MethodMap::Entry& entry : state.methodMap->Entries())
+            {
+                if (!ClassNameMatches(entry.className, componentName))
+                {
+                    continue;
+                }
+
+                ++methodCount;
+                if (firstClass.empty())
+                {
+                    firstClass = entry.className;
+                    firstImage = entry.imageName;
+                }
+            }
+
+            if (methodCount == 0)
+            {
+                return "metadata class not found";
+            }
+
+            std::ostringstream stream;
+            stream << "metadata class " << firstClass;
+            if (!firstImage.empty())
+            {
+                stream << " in " << firstImage;
+            }
+            stream << " (" << methodCount << " methods)";
+            return stream.str();
+        }
+
         void RefreshMonoObjectCache(GuiState* state)
         {
             if (!state)
@@ -659,17 +870,47 @@ namespace Aegis::UnityExternal
                 return;
             }
 
-            const std::optional<std::uint64_t> pointer = ParseUnsignedInteger(state->monoObjectPointer);
-            if (!pointer || *pointer == 0)
+            struct CacheTarget
             {
-                state->monoObjectCacheStatus = "Type a Mono object/vtable pointer first.";
-                AddLog(state, "Mono object cache scan skipped: no object/vtable pointer.");
+                uintptr_t pointer = 0;
+                std::string label;
+                std::string metadata;
+            };
+
+            std::vector<CacheTarget> targets;
+            if (const std::optional<std::uint64_t> pointer = ParseUnsignedInteger(state->monoObjectPointer);
+                pointer && *pointer != 0)
+            {
+                targets.push_back(CacheTarget{
+                    static_cast<uintptr_t>(*pointer),
+                    TrimAscii(state->objectCacheComponentName[0] ? state->objectCacheComponentName : "PlayerController"),
+                    ComponentMetadataSummary(*state, state->objectCacheComponentName)
+                });
+            }
+
+            if (state->objectCacheUseFallback)
+            {
+                if (const std::optional<std::uint64_t> pointer = ParseUnsignedInteger(state->monoObjectFallbackPointer);
+                    pointer && *pointer != 0)
+                {
+                    targets.push_back(CacheTarget{
+                        static_cast<uintptr_t>(*pointer),
+                        TrimAscii(state->objectCacheFallbackComponentName[0] ? state->objectCacheFallbackComponentName : "UnityEngine.Rigidbody"),
+                        ComponentMetadataSummary(*state, state->objectCacheFallbackComponentName)
+                    });
+                }
+            }
+
+            if (targets.empty())
+            {
+                state->monoObjectCacheStatus = "Type a PlayerController or Rigidbody object/vtable pointer first.";
+                AddLog(state, "Mono object cache scan skipped: no component object/vtable pointer.");
                 return;
             }
 
-            const uintptr_t matchPointer = static_cast<uintptr_t>(*pointer);
             const std::size_t maxResults = static_cast<std::size_t>(std::clamp(state->monoObjectMaxResults, 1, 4096));
             constexpr std::size_t kChunkSize = 1024 * 1024;
+            std::size_t positionedCount = 0;
 
             uintptr_t address = 0;
             MEMORY_BASIC_INFORMATION mbi{};
@@ -697,15 +938,24 @@ namespace Aegis::UnityExternal
                             {
                                 uintptr_t candidate = 0;
                                 std::memcpy(&candidate, bytes.data() + offset, sizeof(candidate));
-                                if (candidate != matchPointer)
+                                const auto matchedTarget = std::find_if(targets.begin(), targets.end(), [candidate](const CacheTarget& target) {
+                                    return target.pointer == candidate;
+                                });
+                                if (matchedTarget == targets.end())
                                 {
                                     continue;
                                 }
 
-                                state->monoObjectCache.push_back(MonoObjectCacheEntry{
-                                    chunkBase + offset,
-                                    candidate
-                                });
+                                MonoObjectCacheEntry entry;
+                                entry.address = chunkBase + offset;
+                                entry.matchedPointer = candidate;
+                                entry.label = matchedTarget->label;
+                                entry.hasPosition = ReadObjectCachePosition(*state, entry.address, &entry.position, &entry.positionAddress);
+                                if (entry.hasPosition)
+                                {
+                                    ++positionedCount;
+                                }
+                                state->monoObjectCache.push_back(std::move(entry));
 
                                 if (state->monoObjectCache.size() >= maxResults)
                                 {
@@ -723,9 +973,19 @@ namespace Aegis::UnityExternal
 
             std::ostringstream status;
             status << "Cached " << state->monoObjectCache.size()
-                << " live candidate object(s) for pointer " << FormatHex(matchPointer) << ".";
+                << " live candidate object(s), " << positionedCount
+                << " with readable positions.";
             state->monoObjectCacheStatus = status.str();
             AddLog(state, "%s", state->monoObjectCacheStatus.c_str());
+            for (const CacheTarget& target : targets)
+            {
+                AddLog(
+                    state,
+                    "  %s pointer %s (%s)",
+                    target.label.c_str(),
+                    FormatHex(target.pointer).c_str(),
+                    target.metadata.empty() ? "metadata not loaded" : target.metadata.c_str());
+            }
         }
 
         std::optional<std::vector<PatternByte>> ParseAobPattern(const std::string& text, std::string* error)
@@ -2269,6 +2529,13 @@ namespace Aegis::UnityExternal
             ImGui::SameLine();
             ImGui::Checkbox("Radar", &state->radarEnabled);
 
+            const char* entitySources[] = { "Manual entity list", "Mono object cache" };
+            ImGui::Combo("Entity Source", &state->entitySource, entitySources, IM_ARRAYSIZE(entitySources));
+            if (state->entitySource == 1)
+            {
+                ImGui::TextWrapped("Mono object cache source draws cached objects with readable positions. Configure and refresh the cache in Developer.");
+            }
+
             ImGui::InputTextWithHint("Entity List", "pointer array or first entity address", state->entityListAddress, sizeof(state->entityListAddress));
             ImGui::InputTextWithHint("Entity Count Address", "optional int count address", state->entityCountAddress, sizeof(state->entityCountAddress));
             ImGui::InputInt("Entity Count", &state->entityCount);
@@ -2276,6 +2543,18 @@ namespace Aegis::UnityExternal
             ImGui::Combo("Entity Layout", &state->entityLayout, layouts, IM_ARRAYSIZE(layouts));
             ImGui::InputInt("Entity Stride", &state->entityStride);
             ImGui::InputInt("Position Offset", &state->positionOffset);
+
+            const char* positionModes[] = {
+                "Direct Vec3: object + position offset",
+                "Pointer field -> Vec3",
+                "m_CachedPtr -> native Vec3",
+                "m_CachedPtr -> native Transform ptr -> Vec3",
+                "Reference field -> m_CachedPtr -> native Vec3"
+            };
+            ImGui::Combo("Object Cache Position Mode", &state->objectPositionMode, positionModes, IM_ARRAYSIZE(positionModes));
+            ImGui::InputInt("Object Pointer Offset", &state->objectPointerOffset);
+            ImGui::InputInt("m_CachedPtr Offset", &state->objectCachedPtrOffset);
+            ImGui::InputInt("Transform Pointer Offset", &state->objectTransformPointerOffset);
 
             ImGui::InputTextWithHint("ViewProjection Matrix", "address of 16-float view-projection matrix", state->viewProjectionAddress, sizeof(state->viewProjectionAddress));
             const char* matrixLayouts[] = { "Row-major", "Column-major" };
@@ -2642,20 +2921,36 @@ namespace Aegis::UnityExternal
             ImGui::Separator();
 
             ImGui::Text("Mono Object Cache");
-            ImGui::InputTextWithHint("Object/VTable Pointer##MonoObjectPointer", "0x00000000", state->monoObjectPointer, sizeof(state->monoObjectPointer));
+            ImGui::InputTextWithHint("Primary Component##ObjectCacheComponent", "PlayerController", state->objectCacheComponentName, sizeof(state->objectCacheComponentName));
+            ImGui::InputTextWithHint("Primary Object/VTable Pointer##MonoObjectPointer", "0x00000000", state->monoObjectPointer, sizeof(state->monoObjectPointer));
+            ImGui::InputTextWithHint("Fallback Component##ObjectCacheFallbackComponent", "UnityEngine.Rigidbody", state->objectCacheFallbackComponentName, sizeof(state->objectCacheFallbackComponentName));
+            ImGui::InputTextWithHint("Fallback Object/VTable Pointer##MonoObjectFallbackPointer", "0x00000000", state->monoObjectFallbackPointer, sizeof(state->monoObjectFallbackPointer));
+            ImGui::Checkbox("Use Fallback Component", &state->objectCacheUseFallback);
             ImGui::InputInt("Max Results##MonoObjectMax", &state->monoObjectMaxResults);
             if (ImGui::Button("Refresh Mono Object Cache"))
             {
                 RefreshMonoObjectCache(state);
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Draw Cache In Visual"))
+            {
+                state->entitySource = 1;
+                state->espEnabled = true;
+                state->espBoxes = true;
+                state->espSnaplines = true;
+                AddLog(state, "Visual entity source set to Mono object cache.");
+            }
             if (!state->monoObjectCacheStatus.empty())
             {
                 ImGui::TextWrapped("%s", state->monoObjectCacheStatus.c_str());
             }
-            if (ImGui::BeginTable("##MonoObjectCacheTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 110)))
+            if (ImGui::BeginTable("##MonoObjectCacheTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 140)))
             {
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                 ImGui::TableSetupColumn("Object", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Matched Pointer", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn("Position");
+                ImGui::TableSetupColumn("Position Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                 ImGui::TableHeadersRow();
                 for (std::size_t index = 0; index < state->monoObjectCache.size(); ++index)
@@ -2664,15 +2959,39 @@ namespace Aegis::UnityExternal
                     ImGui::PushID(static_cast<int>(index));
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
-                    ImGui::TextUnformatted(FormatHex(entry.address).c_str());
+                    ImGui::TextUnformatted(entry.label.c_str());
                     ImGui::TableSetColumnIndex(1);
-                    ImGui::TextUnformatted(FormatHex(entry.matchedPointer).c_str());
+                    ImGui::TextUnformatted(FormatHex(entry.address).c_str());
                     ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(FormatHex(entry.matchedPointer).c_str());
+                    ImGui::TableSetColumnIndex(3);
+                    if (entry.hasPosition)
+                    {
+                        ImGui::Text("%.2f, %.2f, %.2f", entry.position.x, entry.position.y, entry.position.z);
+                    }
+                    else
+                    {
+                        ImGui::TextDisabled("n/a");
+                    }
+                    ImGui::TableSetColumnIndex(4);
+                    if (entry.hasPosition)
+                    {
+                        ImGui::TextUnformatted(FormatHex(entry.positionAddress).c_str());
+                    }
+                    else
+                    {
+                        ImGui::TextDisabled("n/a");
+                    }
+                    ImGui::TableSetColumnIndex(5);
                     if (ImGui::SmallButton("Use"))
                     {
                         const std::string address = FormatHex(entry.address);
                         CopyToBuffer(state->readAddress, sizeof(state->readAddress), address);
                         CopyToBuffer(state->watchAddress, sizeof(state->watchAddress), address);
+                        if (entry.hasPosition)
+                        {
+                            CopyToBuffer(state->localPositionAddress, sizeof(state->localPositionAddress), FormatHex(entry.positionAddress));
+                        }
                     }
                     ImGui::PopID();
                 }
