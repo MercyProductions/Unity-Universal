@@ -109,7 +109,7 @@ namespace Aegis::UnityExternal
             ImVec2 head;
         };
 
-        struct MonoObjectCacheEntry
+        struct ObjectCacheEntry
         {
             uintptr_t address = 0;
             uintptr_t matchedPointer = 0;
@@ -117,6 +117,15 @@ namespace Aegis::UnityExternal
             Vec3 position;
             bool hasPosition = false;
             std::string label;
+            std::string source;
+        };
+
+        struct ObjectCacheTarget
+        {
+            uintptr_t pointer = 0;
+            std::string label;
+            std::string metadata;
+            std::string source;
         };
 
         struct GuiState
@@ -142,10 +151,13 @@ namespace Aegis::UnityExternal
             char methodFilter[160] = "";
             char objectCacheComponentName[160] = "PlayerController";
             char objectCacheFallbackComponentName[160] = "UnityEngine.Rigidbody";
-            char monoObjectPointer[80] = "";
-            char monoObjectFallbackPointer[80] = "";
-            int monoObjectMaxResults = 512;
+            char objectCachePointer[80] = "";
+            char objectCacheFallbackPointer[80] = "";
+            int objectCacheMaxResults = 512;
             bool objectCacheUseFallback = true;
+            bool objectCacheAutoResolveIl2Cpp = true;
+            int il2cppClassNameOffset = 0x10;
+            int il2cppClassNamespaceOffset = 0x18;
             int entitySource = 0;
             int objectPositionMode = 2;
             int objectPointerOffset = 0;
@@ -184,8 +196,8 @@ namespace Aegis::UnityExternal
             std::vector<WatchEntry> watches;
             std::vector<ScanResult> scanResults;
             std::vector<EspEntity> espEntities;
-            std::vector<MonoObjectCacheEntry> monoObjectCache;
-            std::string monoObjectCacheStatus;
+            std::vector<ObjectCacheEntry> objectCache;
+            std::string objectCacheStatus;
             std::vector<std::string> log;
         };
 
@@ -712,8 +724,8 @@ namespace Aegis::UnityExternal
             state->espEntities.clear();
             if (state->entitySource == 1)
             {
-                state->espEntities.reserve(state->monoObjectCache.size());
-                for (MonoObjectCacheEntry& cached : state->monoObjectCache)
+                state->espEntities.reserve(state->objectCache.size());
+                for (ObjectCacheEntry& cached : state->objectCache)
                 {
                     cached.hasPosition = ReadObjectCachePosition(*state, cached.address, &cached.position, &cached.positionAddress);
                     if (!cached.hasPosition)
@@ -846,75 +858,437 @@ namespace Aegis::UnityExternal
             return stream.str();
         }
 
-        void RefreshMonoObjectCache(GuiState* state)
+        bool AddUniqueAddress(std::vector<uintptr_t>* values, uintptr_t value, std::size_t maxValues)
+        {
+            if (!values || value == 0 || values->size() >= maxValues ||
+                std::find(values->begin(), values->end(), value) != values->end())
+            {
+                return false;
+            }
+
+            values->push_back(value);
+            return true;
+        }
+
+        bool ContainsAddress(const std::vector<uintptr_t>& values, uintptr_t value)
+        {
+            return std::find(values.begin(), values.end(), value) != values.end();
+        }
+
+        bool AddUniqueObjectCacheTarget(std::vector<ObjectCacheTarget>* targets, ObjectCacheTarget target)
+        {
+            if (!targets || target.pointer == 0 ||
+                std::find_if(targets->begin(), targets->end(), [target](const ObjectCacheTarget& existing) {
+                    return existing.pointer == target.pointer;
+                }) != targets->end())
+            {
+                return false;
+            }
+
+            targets->push_back(std::move(target));
+            return true;
+        }
+
+        bool IsAllowedMemoryType(DWORD type, bool includeImages)
+        {
+            return type == MEM_PRIVATE ||
+                type == MEM_MAPPED ||
+                (includeImages && type == MEM_IMAGE);
+        }
+
+        std::string ReadAsciiCString(const ExternalMemoryReader& reader, uintptr_t address, std::size_t maxLength)
+        {
+            if (address == 0 || maxLength == 0)
+            {
+                return {};
+            }
+
+            const std::vector<std::uint8_t> bytes = reader.ReadBytes(address, maxLength);
+            std::string value;
+            value.reserve(bytes.size());
+            for (std::uint8_t byte : bytes)
+            {
+                if (byte == 0)
+                {
+                    return value;
+                }
+
+                if (byte < 0x20 || byte > 0x7E)
+                {
+                    return {};
+                }
+
+                value.push_back(static_cast<char>(byte));
+            }
+
+            return {};
+        }
+
+        std::vector<uintptr_t> FindAsciiStringAddresses(
+            const GuiState& state,
+            const std::string& text,
+            std::size_t maxResults)
+        {
+            std::vector<uintptr_t> results;
+            if (!state.reader.IsOpen() || !state.reader.ProcessHandle() || text.empty() || maxResults == 0)
+            {
+                return results;
+            }
+
+            std::vector<std::uint8_t> needle(text.begin(), text.end());
+            needle.push_back(0);
+
+            constexpr std::size_t kChunkSize = 1024 * 1024;
+            const std::size_t overlap = std::min<std::size_t>(needle.size() > 0 ? needle.size() - 1 : 0, 4096);
+            uintptr_t address = 0;
+            MEMORY_BASIC_INFORMATION mbi{};
+            while (results.size() < maxResults &&
+                VirtualQueryEx(state.reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
+            {
+                const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                const uintptr_t next = base + mbi.RegionSize;
+                if (next <= base)
+                {
+                    break;
+                }
+
+                if (mbi.State == MEM_COMMIT &&
+                    IsAllowedMemoryType(mbi.Type, true) &&
+                    IsReadableMemoryProtection(mbi.Protect))
+                {
+                    for (uintptr_t chunkBase = base; chunkBase < next && results.size() < maxResults;)
+                    {
+                        const std::size_t chunkSize = static_cast<std::size_t>(std::min<std::uint64_t>(kChunkSize, next - chunkBase));
+                        const std::vector<std::uint8_t> bytes = state.reader.ReadBytes(chunkBase, chunkSize);
+                        if (bytes.size() >= needle.size())
+                        {
+                            for (std::size_t offset = 0; offset + needle.size() <= bytes.size(); ++offset)
+                            {
+                                if (std::memcmp(bytes.data() + offset, needle.data(), needle.size()) == 0)
+                                {
+                                    AddUniqueAddress(&results, chunkBase + offset, maxResults);
+                                    if (results.size() >= maxResults)
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        const uintptr_t chunkEnd = chunkBase + chunkSize;
+                        if (chunkEnd >= next)
+                        {
+                            break;
+                        }
+                        chunkBase = overlap > 0 && chunkSize > overlap ? chunkEnd - overlap : chunkEnd;
+                    }
+                }
+
+                address = next;
+            }
+
+            return results;
+        }
+
+        std::vector<uintptr_t> FindPointerReferences(
+            const GuiState& state,
+            const std::vector<uintptr_t>& pointerValues,
+            std::size_t maxResults)
+        {
+            std::vector<uintptr_t> results;
+            if (!state.reader.IsOpen() || !state.reader.ProcessHandle() || pointerValues.empty() || maxResults == 0)
+            {
+                return results;
+            }
+
+            constexpr std::size_t kChunkSize = 1024 * 1024;
+            uintptr_t address = 0;
+            MEMORY_BASIC_INFORMATION mbi{};
+            while (results.size() < maxResults &&
+                VirtualQueryEx(state.reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
+            {
+                const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                const uintptr_t next = base + mbi.RegionSize;
+                if (next <= base)
+                {
+                    break;
+                }
+
+                if (mbi.State == MEM_COMMIT &&
+                    IsAllowedMemoryType(mbi.Type, true) &&
+                    IsReadableMemoryProtection(mbi.Protect))
+                {
+                    for (uintptr_t chunkBase = base; chunkBase < next && results.size() < maxResults;)
+                    {
+                        const std::size_t chunkSize = static_cast<std::size_t>(std::min<std::uint64_t>(kChunkSize, next - chunkBase));
+                        const std::vector<std::uint8_t> bytes = state.reader.ReadBytes(chunkBase, chunkSize);
+                        if (bytes.size() >= sizeof(uintptr_t))
+                        {
+                            for (std::size_t offset = 0; offset + sizeof(uintptr_t) <= bytes.size(); offset += sizeof(uintptr_t))
+                            {
+                                uintptr_t candidate = 0;
+                                std::memcpy(&candidate, bytes.data() + offset, sizeof(candidate));
+                                if (!ContainsAddress(pointerValues, candidate))
+                                {
+                                    continue;
+                                }
+
+                                AddUniqueAddress(&results, chunkBase + offset, maxResults);
+                                if (results.size() >= maxResults)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+
+                        chunkBase += chunkSize;
+                    }
+                }
+
+                address = next;
+            }
+
+            return results;
+        }
+
+        struct TypeNameParts
+        {
+            std::string namespaceName;
+            std::string className;
+            bool hasNamespace = false;
+        };
+
+        TypeNameParts SplitTypeName(std::string typeName)
+        {
+            typeName = TrimAscii(std::move(typeName));
+            const std::size_t separator = typeName.rfind('.');
+            if (separator == std::string::npos || separator + 1 >= typeName.size())
+            {
+                return TypeNameParts{ {}, typeName, false };
+            }
+
+            return TypeNameParts{
+                typeName.substr(0, separator),
+                typeName.substr(separator + 1),
+                true
+            };
+        }
+
+        std::vector<uintptr_t> ResolveIl2CppClassPointersByName(
+            const GuiState& state,
+            const std::string& componentName,
+            std::string* detail)
+        {
+            std::vector<uintptr_t> classPointers;
+            const TypeNameParts parts = SplitTypeName(componentName);
+            if (parts.className.empty())
+            {
+                if (detail)
+                {
+                    *detail = "empty class name";
+                }
+                return classPointers;
+            }
+
+            if (state.il2cppClassNameOffset < 0 || state.il2cppClassNamespaceOffset < 0)
+            {
+                if (detail)
+                {
+                    *detail = "class metadata offsets must be non-negative";
+                }
+                return classPointers;
+            }
+
+            const std::vector<uintptr_t> nameStrings = FindAsciiStringAddresses(state, parts.className, 128);
+            if (nameStrings.empty())
+            {
+                if (detail)
+                {
+                    *detail = "class-name string not found in readable target memory";
+                }
+                return classPointers;
+            }
+
+            std::vector<uintptr_t> namespaceStrings;
+            if (parts.hasNamespace)
+            {
+                namespaceStrings = FindAsciiStringAddresses(state, parts.namespaceName, 128);
+            }
+
+            const std::vector<uintptr_t> nameReferences = FindPointerReferences(state, nameStrings, 512);
+            for (uintptr_t reference : nameReferences)
+            {
+                if (reference < static_cast<uintptr_t>(state.il2cppClassNameOffset))
+                {
+                    continue;
+                }
+
+                const uintptr_t classPointer = reference - static_cast<uintptr_t>(state.il2cppClassNameOffset);
+                if (classPointer == 0 || (classPointer % sizeof(uintptr_t)) != 0)
+                {
+                    continue;
+                }
+
+                const std::optional<uintptr_t> namePointer =
+                    state.reader.Read<uintptr_t>(OffsetAddress(classPointer, state.il2cppClassNameOffset));
+                if (!namePointer || !ContainsAddress(nameStrings, *namePointer))
+                {
+                    continue;
+                }
+
+                if (parts.hasNamespace)
+                {
+                    const std::optional<uintptr_t> namespacePointer =
+                        state.reader.Read<uintptr_t>(OffsetAddress(classPointer, state.il2cppClassNamespaceOffset));
+                    if (!namespacePointer)
+                    {
+                        continue;
+                    }
+
+                    bool namespaceMatches = ContainsAddress(namespaceStrings, *namespacePointer);
+                    if (!namespaceMatches)
+                    {
+                        namespaceMatches = ReadAsciiCString(state.reader, *namespacePointer, 256) == parts.namespaceName;
+                    }
+
+                    if (!namespaceMatches)
+                    {
+                        continue;
+                    }
+                }
+
+                AddUniqueAddress(&classPointers, classPointer, 32);
+            }
+
+            if (detail)
+            {
+                std::ostringstream stream;
+                stream << "found " << classPointers.size()
+                    << " candidate Il2CppClass pointer(s), "
+                    << nameStrings.size() << " class-name string(s), "
+                    << nameReferences.size() << " name reference(s)";
+                if (parts.hasNamespace)
+                {
+                    stream << ", " << namespaceStrings.size() << " namespace string(s)";
+                }
+                *detail = stream.str();
+            }
+
+            return classPointers;
+        }
+
+        void AddIl2CppAutoClassTargets(GuiState* state, std::vector<ObjectCacheTarget>* targets, const std::string& componentName)
+        {
+            if (!state || !targets || !state->objectCacheAutoResolveIl2Cpp || !state->process ||
+                state->process->modules.Backend() != RuntimeBackend::IL2CPP)
+            {
+                return;
+            }
+
+            const std::string label = TrimAscii(componentName);
+            if (label.empty())
+            {
+                return;
+            }
+
+            std::string detail;
+            const std::vector<uintptr_t> classPointers = ResolveIl2CppClassPointersByName(*state, label, &detail);
+            AddLog(state, "IL2CPP class scan for %s: %s", label.c_str(), detail.c_str());
+
+            for (uintptr_t classPointer : classPointers)
+            {
+                AddUniqueObjectCacheTarget(targets, ObjectCacheTarget{
+                    classPointer,
+                    label,
+                    ComponentMetadataSummary(*state, label),
+                    "il2cpp class-name scan"
+                });
+            }
+        }
+
+        void RefreshObjectCache(GuiState* state)
         {
             if (!state)
             {
                 return;
             }
 
-            state->monoObjectCache.clear();
-            state->monoObjectCacheStatus.clear();
+            state->objectCache.clear();
+            state->objectCacheStatus.clear();
 
-            if (!state->process || state->process->modules.Backend() != RuntimeBackend::Mono)
+            if (!state->process ||
+                (state->process->modules.Backend() != RuntimeBackend::Mono &&
+                    state->process->modules.Backend() != RuntimeBackend::IL2CPP))
             {
-                state->monoObjectCacheStatus = "Attach to a Mono target first.";
-                AddLog(state, "Mono object cache scan skipped: target is not Mono.");
+                state->objectCacheStatus = "Attach to a Mono or IL2CPP target first.";
+                AddLog(state, "Object cache scan skipped: target is not Mono or IL2CPP.");
                 return;
             }
 
             if (!state->reader.IsOpen() || !state->reader.ProcessHandle())
             {
-                state->monoObjectCacheStatus = "Target memory is not open for reading.";
-                AddLog(state, "Mono object cache scan skipped: no read handle.");
+                state->objectCacheStatus = "Target memory is not open for reading.";
+                AddLog(state, "Object cache scan skipped: no read handle.");
                 return;
             }
 
-            struct CacheTarget
-            {
-                uintptr_t pointer = 0;
-                std::string label;
-                std::string metadata;
-            };
+            const RuntimeBackend backend = state->process->modules.Backend();
+            const std::string backendName = WideToUtf8(RuntimeBackendName(backend));
+            const std::string primaryLabel = TrimAscii(state->objectCacheComponentName[0] ? state->objectCacheComponentName : "PlayerController");
+            const std::string fallbackLabel = TrimAscii(state->objectCacheFallbackComponentName[0] ? state->objectCacheFallbackComponentName : "UnityEngine.Rigidbody");
 
-            std::vector<CacheTarget> targets;
-            if (const std::optional<std::uint64_t> pointer = ParseUnsignedInteger(state->monoObjectPointer);
+            std::vector<ObjectCacheTarget> targets;
+            if (const std::optional<std::uint64_t> pointer = ParseUnsignedInteger(state->objectCachePointer);
                 pointer && *pointer != 0)
             {
-                targets.push_back(CacheTarget{
+                AddUniqueObjectCacheTarget(&targets, ObjectCacheTarget{
                     static_cast<uintptr_t>(*pointer),
-                    TrimAscii(state->objectCacheComponentName[0] ? state->objectCacheComponentName : "PlayerController"),
-                    ComponentMetadataSummary(*state, state->objectCacheComponentName)
+                    primaryLabel,
+                    ComponentMetadataSummary(*state, primaryLabel),
+                    backend == RuntimeBackend::IL2CPP ? "manual Il2CppClass/header pointer" : "manual Mono object/vtable pointer"
                 });
             }
 
             if (state->objectCacheUseFallback)
             {
-                if (const std::optional<std::uint64_t> pointer = ParseUnsignedInteger(state->monoObjectFallbackPointer);
+                if (const std::optional<std::uint64_t> pointer = ParseUnsignedInteger(state->objectCacheFallbackPointer);
                     pointer && *pointer != 0)
                 {
-                    targets.push_back(CacheTarget{
+                    AddUniqueObjectCacheTarget(&targets, ObjectCacheTarget{
                         static_cast<uintptr_t>(*pointer),
-                        TrimAscii(state->objectCacheFallbackComponentName[0] ? state->objectCacheFallbackComponentName : "UnityEngine.Rigidbody"),
-                        ComponentMetadataSummary(*state, state->objectCacheFallbackComponentName)
+                        fallbackLabel,
+                        ComponentMetadataSummary(*state, fallbackLabel),
+                        backend == RuntimeBackend::IL2CPP ? "manual Il2CppClass/header pointer" : "manual Mono object/vtable pointer"
                     });
+                }
+            }
+
+            if (backend == RuntimeBackend::IL2CPP)
+            {
+                AddIl2CppAutoClassTargets(state, &targets, primaryLabel);
+                if (state->objectCacheUseFallback)
+                {
+                    AddIl2CppAutoClassTargets(state, &targets, fallbackLabel);
                 }
             }
 
             if (targets.empty())
             {
-                state->monoObjectCacheStatus = "Type a PlayerController or Rigidbody object/vtable pointer first.";
-                AddLog(state, "Mono object cache scan skipped: no component object/vtable pointer.");
+                state->objectCacheStatus =
+                    backend == RuntimeBackend::IL2CPP
+                    ? "No IL2CPP class pointer found. Paste an Il2CppClass/header pointer or adjust class offsets."
+                    : "Type a PlayerController or Rigidbody object/vtable pointer first.";
+                AddLog(state, "Object cache scan skipped: no component class/header pointer.");
                 return;
             }
 
-            const std::size_t maxResults = static_cast<std::size_t>(std::clamp(state->monoObjectMaxResults, 1, 4096));
+            const std::size_t maxResults = static_cast<std::size_t>(std::clamp(state->objectCacheMaxResults, 1, 4096));
             constexpr std::size_t kChunkSize = 1024 * 1024;
             std::size_t positionedCount = 0;
 
             uintptr_t address = 0;
             MEMORY_BASIC_INFORMATION mbi{};
-            while (state->monoObjectCache.size() < maxResults &&
+            while (state->objectCache.size() < maxResults &&
                 VirtualQueryEx(state->reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
             {
                 const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
@@ -925,10 +1299,10 @@ namespace Aegis::UnityExternal
                 }
 
                 if (mbi.State == MEM_COMMIT &&
-                    (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED) &&
+                    IsAllowedMemoryType(mbi.Type, false) &&
                     IsReadableMemoryProtection(mbi.Protect))
                 {
-                    for (uintptr_t chunkBase = base; chunkBase < next && state->monoObjectCache.size() < maxResults;)
+                    for (uintptr_t chunkBase = base; chunkBase < next && state->objectCache.size() < maxResults;)
                     {
                         const std::size_t chunkSize = static_cast<std::size_t>(std::min<std::uint64_t>(kChunkSize, next - chunkBase));
                         const std::vector<std::uint8_t> bytes = state->reader.ReadBytes(chunkBase, chunkSize);
@@ -938,7 +1312,7 @@ namespace Aegis::UnityExternal
                             {
                                 uintptr_t candidate = 0;
                                 std::memcpy(&candidate, bytes.data() + offset, sizeof(candidate));
-                                const auto matchedTarget = std::find_if(targets.begin(), targets.end(), [candidate](const CacheTarget& target) {
+                                const auto matchedTarget = std::find_if(targets.begin(), targets.end(), [candidate](const ObjectCacheTarget& target) {
                                     return target.pointer == candidate;
                                 });
                                 if (matchedTarget == targets.end())
@@ -946,18 +1320,19 @@ namespace Aegis::UnityExternal
                                     continue;
                                 }
 
-                                MonoObjectCacheEntry entry;
+                                ObjectCacheEntry entry;
                                 entry.address = chunkBase + offset;
                                 entry.matchedPointer = candidate;
                                 entry.label = matchedTarget->label;
+                                entry.source = matchedTarget->source;
                                 entry.hasPosition = ReadObjectCachePosition(*state, entry.address, &entry.position, &entry.positionAddress);
                                 if (entry.hasPosition)
                                 {
                                     ++positionedCount;
                                 }
-                                state->monoObjectCache.push_back(std::move(entry));
+                                state->objectCache.push_back(std::move(entry));
 
-                                if (state->monoObjectCache.size() >= maxResults)
+                                if (state->objectCache.size() >= maxResults)
                                 {
                                     break;
                                 }
@@ -972,18 +1347,19 @@ namespace Aegis::UnityExternal
             }
 
             std::ostringstream status;
-            status << "Cached " << state->monoObjectCache.size()
+            status << backendName << " cached " << state->objectCache.size()
                 << " live candidate object(s), " << positionedCount
                 << " with readable positions.";
-            state->monoObjectCacheStatus = status.str();
-            AddLog(state, "%s", state->monoObjectCacheStatus.c_str());
-            for (const CacheTarget& target : targets)
+            state->objectCacheStatus = status.str();
+            AddLog(state, "%s", state->objectCacheStatus.c_str());
+            for (const ObjectCacheTarget& target : targets)
             {
                 AddLog(
                     state,
-                    "  %s pointer %s (%s)",
+                    "  %s pointer %s [%s] (%s)",
                     target.label.c_str(),
                     FormatHex(target.pointer).c_str(),
+                    target.source.c_str(),
                     target.metadata.empty() ? "metadata not loaded" : target.metadata.c_str());
             }
         }
@@ -2529,11 +2905,11 @@ namespace Aegis::UnityExternal
             ImGui::SameLine();
             ImGui::Checkbox("Radar", &state->radarEnabled);
 
-            const char* entitySources[] = { "Manual entity list", "Mono object cache" };
+            const char* entitySources[] = { "Manual entity list", "Object cache" };
             ImGui::Combo("Entity Source", &state->entitySource, entitySources, IM_ARRAYSIZE(entitySources));
             if (state->entitySource == 1)
             {
-                ImGui::TextWrapped("Mono object cache source draws cached objects with readable positions. Configure and refresh the cache in Developer.");
+                ImGui::TextWrapped("Object cache source draws cached Mono or IL2CPP objects with readable positions. Configure and refresh the cache in Developer.");
             }
 
             ImGui::InputTextWithHint("Entity List", "pointer array or first entity address", state->entityListAddress, sizeof(state->entityListAddress));
@@ -2920,16 +3296,20 @@ namespace Aegis::UnityExternal
             DrawProcessTable(state);
             ImGui::Separator();
 
-            ImGui::Text("Mono Object Cache");
+            ImGui::Text("Runtime Object Cache");
+            ImGui::TextWrapped("Mono scans for object/vtable pointers. IL2CPP scans for Il2CppClass/header pointers and can try to discover class pointers by readable class-name metadata.");
             ImGui::InputTextWithHint("Primary Component##ObjectCacheComponent", "PlayerController", state->objectCacheComponentName, sizeof(state->objectCacheComponentName));
-            ImGui::InputTextWithHint("Primary Object/VTable Pointer##MonoObjectPointer", "0x00000000", state->monoObjectPointer, sizeof(state->monoObjectPointer));
+            ImGui::InputTextWithHint("Primary Class/Header Pointer##ObjectCachePointer", "0x00000000", state->objectCachePointer, sizeof(state->objectCachePointer));
             ImGui::InputTextWithHint("Fallback Component##ObjectCacheFallbackComponent", "UnityEngine.Rigidbody", state->objectCacheFallbackComponentName, sizeof(state->objectCacheFallbackComponentName));
-            ImGui::InputTextWithHint("Fallback Object/VTable Pointer##MonoObjectFallbackPointer", "0x00000000", state->monoObjectFallbackPointer, sizeof(state->monoObjectFallbackPointer));
+            ImGui::InputTextWithHint("Fallback Class/Header Pointer##ObjectCacheFallbackPointer", "0x00000000", state->objectCacheFallbackPointer, sizeof(state->objectCacheFallbackPointer));
             ImGui::Checkbox("Use Fallback Component", &state->objectCacheUseFallback);
-            ImGui::InputInt("Max Results##MonoObjectMax", &state->monoObjectMaxResults);
-            if (ImGui::Button("Refresh Mono Object Cache"))
+            ImGui::Checkbox("Auto Resolve IL2CPP Class Pointers", &state->objectCacheAutoResolveIl2Cpp);
+            ImGui::InputInt("Il2CppClass name offset", &state->il2cppClassNameOffset);
+            ImGui::InputInt("Il2CppClass namespace offset", &state->il2cppClassNamespaceOffset);
+            ImGui::InputInt("Max Results##ObjectCacheMax", &state->objectCacheMaxResults);
+            if (ImGui::Button("Refresh Object Cache"))
             {
-                RefreshMonoObjectCache(state);
+                RefreshObjectCache(state);
             }
             ImGui::SameLine();
             if (ImGui::Button("Draw Cache In Visual"))
@@ -2938,24 +3318,25 @@ namespace Aegis::UnityExternal
                 state->espEnabled = true;
                 state->espBoxes = true;
                 state->espSnaplines = true;
-                AddLog(state, "Visual entity source set to Mono object cache.");
+                AddLog(state, "Visual entity source set to object cache.");
             }
-            if (!state->monoObjectCacheStatus.empty())
+            if (!state->objectCacheStatus.empty())
             {
-                ImGui::TextWrapped("%s", state->monoObjectCacheStatus.c_str());
+                ImGui::TextWrapped("%s", state->objectCacheStatus.c_str());
             }
-            if (ImGui::BeginTable("##MonoObjectCacheTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 140)))
+            if (ImGui::BeginTable("##ObjectCacheTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 140)))
             {
                 ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                 ImGui::TableSetupColumn("Object", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Matched Pointer", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Position");
                 ImGui::TableSetupColumn("Position Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                 ImGui::TableHeadersRow();
-                for (std::size_t index = 0; index < state->monoObjectCache.size(); ++index)
+                for (std::size_t index = 0; index < state->objectCache.size(); ++index)
                 {
-                    const MonoObjectCacheEntry& entry = state->monoObjectCache[index];
+                    const ObjectCacheEntry& entry = state->objectCache[index];
                     ImGui::PushID(static_cast<int>(index));
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
@@ -2965,6 +3346,8 @@ namespace Aegis::UnityExternal
                     ImGui::TableSetColumnIndex(2);
                     ImGui::TextUnformatted(FormatHex(entry.matchedPointer).c_str());
                     ImGui::TableSetColumnIndex(3);
+                    ImGui::TextUnformatted(entry.source.c_str());
+                    ImGui::TableSetColumnIndex(4);
                     if (entry.hasPosition)
                     {
                         ImGui::Text("%.2f, %.2f, %.2f", entry.position.x, entry.position.y, entry.position.z);
@@ -2973,7 +3356,7 @@ namespace Aegis::UnityExternal
                     {
                         ImGui::TextDisabled("n/a");
                     }
-                    ImGui::TableSetColumnIndex(4);
+                    ImGui::TableSetColumnIndex(5);
                     if (entry.hasPosition)
                     {
                         ImGui::TextUnformatted(FormatHex(entry.positionAddress).c_str());
@@ -2982,7 +3365,7 @@ namespace Aegis::UnityExternal
                     {
                         ImGui::TextDisabled("n/a");
                     }
-                    ImGui::TableSetColumnIndex(5);
+                    ImGui::TableSetColumnIndex(6);
                     if (ImGui::SmallButton("Use"))
                     {
                         const std::string address = FormatHex(entry.address);

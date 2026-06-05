@@ -20,7 +20,7 @@ The internal and external builds share the same goal: make Unity runtime inspect
 | Runtime export resolver | Yes | Yes |
 | IL2CPP method resolving | Yes, plus generated/internal SDK data when available | Yes, from maps/dumps or auto-generated metadata map |
 | Mono method resolving | Yes, through the internal Mono runtime helpers | Yes for metadata identity from `_Data\Managed` assemblies; no target-process invocation |
-| Object/GameObject cache | Yes | Offset-driven visuals plus a read-only Mono object/vtable pointer candidate cache |
+| Object/GameObject cache | Yes | Offset-driven visuals plus a read-only Mono/IL2CPP runtime pointer candidate cache |
 | ESP/radar/crosshair | In-game overlay path | Offset-driven external overlay path |
 | Lua | Yes, internal process scripting surface | No |
 | Memory writes/patches | Internal features can modify in-process state | No; external memory access is read-only |
@@ -239,9 +239,15 @@ IL RVA when present
 
 Mono method resolution therefore returns a metadata identity, such as `UnityEngine.Time::get_timeScale -> token 0x060014BA`. It does not pretend that token is a callable native address. Normal Mono JIT/native addresses are runtime-dependent and require code running inside the target to compile or invoke methods.
 
-The Developer tab also includes a read-only Mono object cache scanner. Provide a Mono object/vtable pointer for a component such as `PlayerController`, and optionally a fallback pointer for `UnityEngine.Rigidbody`, then refresh the cache. The scanner walks committed readable private/mapped memory with `VirtualQueryEx` and caches addresses whose first pointer-sized field matches either supplied pointer. This gives you a live external candidate list without injection or writes, but it still needs a known pointer from your own diagnostics, symbols, logs, or internal testing.
+## External Runtime Object Cache
 
-Cached Mono objects can feed the Visual tab. Set `Entity Source` to `Mono object cache`, configure the position extraction mode/offsets, provide the view-projection matrix address, and enable ESP boxes/snaplines. The overlay re-reads cached object positions every frame before world-to-screen, so boxes can move with the objects once the offsets are correct.
+The Developer tab includes a read-only runtime object cache scanner for both Mono and IL2CPP. Enter a primary component name such as `PlayerController` and an optional fallback such as `UnityEngine.Rigidbody`, then refresh the cache. The scanner walks committed readable private/mapped memory with `VirtualQueryEx` and caches addresses whose first pointer-sized field matches a target runtime header pointer.
+
+For Mono, provide the Mono object/vtable pointer for the component when you know it from your own diagnostics, symbols, logs, or internal testing.
+
+For IL2CPP, provide an `Il2CppClass*` or object-header class pointer when you already know it. The external can also attempt a read-only class-name scan: it searches readable process memory for class-name strings, finds candidate `Il2CppClass::name` references, validates the namespace when a fully qualified name is used, and then scans for live objects whose first pointer matches the candidate class pointer. The default x64 `Il2CppClass::name` and `Il2CppClass::namespaze` offsets are `0x10` and `0x18`; both are configurable in the Developer tab for Unity-version/layout differences.
+
+Cached runtime objects can feed the Visual tab. Set `Entity Source` to `Object cache`, configure the position extraction mode/offsets, provide the view-projection matrix address, and enable ESP boxes/snaplines. The overlay re-reads cached object positions every frame before world-to-screen, so boxes can move with the objects once the offsets are correct.
 
 Object-cache position modes:
 
@@ -253,9 +259,9 @@ m_CachedPtr -> native Transform ptr -> Vec3
 Reference field -> m_CachedPtr -> native Vec3
 ```
 
-The default `m_CachedPtr` offset is `0x10`, which matches the common x64 Mono object header plus the first inherited `UnityEngine.Object` field layout. Native Rigidbody/Transform position offsets are Unity-version and game-layout dependent, so those remain configurable.
+The default `m_CachedPtr` offset is `0x10`, which matches the common x64 managed object header plus the first inherited `UnityEngine.Object` field layout. Native Rigidbody/Transform position offsets are Unity-version and game-layout dependent, so those remain configurable.
 
-Use the internal DLL when you need full Mono runtime interaction or actual managed calls. Use the external tool when you want read-only process diagnostics without running code inside the game process.
+Use the internal DLL when you need full runtime interaction or actual in-process IL2CPP/Mono calls. Use the external tool when you want read-only process diagnostics without running code inside the game process.
 
 ## External Visuals, ESP, And Radar
 
@@ -284,7 +290,7 @@ The external tool stays out-of-process:
 5. It loads method RVAs from maps/dumps, generates an IL2CPP map from metadata, or generates a Mono metadata map from managed assemblies.
 6. For IL2CPP/native maps, it turns RVAs into live addresses using the target module base.
 7. For Mono metadata maps, it reports MethodDef tokens and IL RVAs as metadata identities.
-8. It exposes read-only diagnostics, AOB scanning, typed memory reads, method browsing, a Mono pointer-scanned object cache, and object-cache/manual offset-driven visuals in ImGui.
+8. It exposes read-only diagnostics, AOB scanning, typed memory reads, method browsing, a runtime pointer-scanned object cache, and object-cache/manual offset-driven visuals in ImGui.
 
 The external project intentionally does not inject, hook the game renderer, call managed methods, patch code, or write memory. It is meant for authorized read-only inspection and prototype overlay work.
 
@@ -298,11 +304,13 @@ For a game you own or are authorized to inspect:
 4. For Mono projects, keep the normal `<GameName>_Data\Managed` folder beside the executable so the external can auto-generate the metadata map.
 5. Start the game, then launch the external executable and type the process exe name.
 6. Confirm the console reports the expected runtime, module addresses, and method-map status.
-7. Use the external Developer and Universal tabs to inspect exports, method maps, process modules, AOB scans, Mono object-cache candidates, and read-only memory values.
-8. For Mono object-cache ESP, enter `PlayerController` as the primary component, `UnityEngine.Rigidbody` as the fallback, provide the matching object/vtable pointer(s), refresh the cache, then click `Draw Cache In Visual`.
-9. In Visual, set `Entity Source` to `Mono object cache`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen.
-10. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, Mono object/vtable pointer, or native position offsets.
-11. Use manual external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
+7. Use the external Developer and Universal tabs to inspect exports, method maps, process modules, AOB scans, object-cache candidates, and read-only memory values.
+8. For runtime object-cache ESP, enter `PlayerController` as the primary component and `UnityEngine.Rigidbody` as the fallback.
+9. On Mono, provide the matching object/vtable pointer(s). On IL2CPP, leave `Auto Resolve IL2CPP Class Pointers` enabled or provide the matching `Il2CppClass*`/header pointer(s) manually.
+10. Refresh the cache, then click `Draw Cache In Visual`.
+11. In Visual, set `Entity Source` to `Object cache`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen.
+12. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, Mono object/vtable pointer, IL2CPP class pointer, or native position offsets.
+13. Use manual external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
 
 For best results, start with a small Unity test scene that has a known `PlayerController`, one camera, and a few spawned test objects. Confirm the internal cache sees the component, then move to the external prototype once you know which memory structures you want to read.
 
@@ -316,7 +324,8 @@ For best results, start with a small Unity test scene that has a known `PlayerCo
 - No Lua execution externally.
 - No memory writes or patching.
 - Direct Mono invocation through `mono_runtime_invoke` remains internal-only because a real call must execute inside the target process.
-- External Mono object caching resolves component metadata names and caches live candidates from supplied Mono object/vtable pointers; it is not a full automatic managed heap walker yet.
+- External object caching resolves component metadata names and caches live candidates from supplied Mono object/vtable pointers or IL2CPP class/header pointers; it is not a full automatic managed heap walker yet.
+- External IL2CPP class-pointer auto-resolution is best-effort and depends on readable metadata strings plus the configured `Il2CppClass` name/namespace offsets.
 - External object-cache ESP needs a correct position extraction mode, position offsets, and view-projection matrix address.
 - IL2CPP auto-map generation depends on metadata layout and may fail on custom or unsupported Unity builds.
 - Mono metadata-map generation depends on standard managed assembly metadata in `_Data\Managed`.
