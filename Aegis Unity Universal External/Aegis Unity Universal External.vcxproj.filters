@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="ImGui">
+      <UniqueIdentifier>{B4BD1E45-7036-43D8-9B5F-9A13E1B8C1F4}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\Aegis Unity Universal\Libraries\imgui\imgui.cpp">
+      <Filter>ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Aegis Unity Universal\Libraries\imgui\imgui_draw.cpp">
+      <Filter>ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Aegis Unity Universal\Libraries\imgui\imgui_impl_dx11.cpp">
+      <Filter>ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Aegis Unity Universal\Libraries\imgui\imgui_impl_win32.cpp">
+      <Filter>ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Aegis Unity Universal\Libraries\imgui\imgui_tables.cpp">
+      <Filter>ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Aegis Unity Universal\Libraries\imgui\imgui_widgets.cpp">
+      <Filter>ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ExternalGui.cpp" />
+    <ClCompile Include="ExternalIl2CppMapGenerator.cpp" />
+    <ClCompile Include="ExternalMemory.cpp" />
+    <ClCompile Include="ExternalMethodResolver.cpp" />
+    <ClCompile Include="ExternalProcess.cpp" />
+    <ClCompile Include="main.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Aegis Unity Universal\Libraries\imgui\imconfig.h">
+      <Filter>ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Aegis Unity Universal\Libraries\imgui\imgui.h">
+      <Filter>ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Aegis Unity Universal\Libraries\imgui\imgui_impl_dx11.h">
+      <Filter>ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Aegis Unity Universal\Libraries\imgui\imgui_impl_win32.h">
+      <Filter>ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ExternalGui.hpp" />
+    <ClInclude Include="ExternalIl2CppMapGenerator.hpp" />
+    <ClInclude Include="ExternalMemory.hpp" />
+    <ClInclude Include="ExternalMethodResolver.hpp" />
+    <ClInclude Include="ExternalProcess.hpp" />
+  </ItemGroup>
+</Project>

@@ -132,9 +132,9 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>
     <ProjectGuid>{04B17470-CB82-4724-904B-25445926AB86}</ProjectGuid>
-    <RootNamespace>AegisUnityUniversal</RootNamespace>
+    <RootNamespace>AegisUnityUniversalInternal</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <ProjectName>AegisUnityUniversal</ProjectName>
+    <ProjectName>AegisUnityUniversalInternal</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -185,23 +185,27 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <LibraryPath>C:\Program Files %28x86%29\Microsoft DirectX SDK %28June 2010%29\Lib\x86;$(LibraryPath)</LibraryPath>
     <IncludePath>C:\Program Files %28x86%29\Microsoft DirectX SDK %28June 2010%29\Include;$(IncludePath)</IncludePath>
+    <OutDir>$(MSBuildProjectDirectory)\..\build\internal\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\..\build\intermediate\internal\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <LibraryPath>C:\Program Files %28x86%29\Microsoft DirectX SDK %28June 2010%29\Lib\x86;$(LibraryPath)</LibraryPath>
     <IncludePath>C:\Program Files %28x86%29\Microsoft DirectX SDK %28June 2010%29\Include;$(IncludePath)</IncludePath>
+    <OutDir>$(MSBuildProjectDirectory)\..\build\internal\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\..\build\intermediate\internal\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LibraryPath>$(SolutionDir)vcpkg_installed\x64-windows-static\x64-windows-static\lib;C:\Program Files %28x86%29\Microsoft DirectX SDK %28June 2010%29\Lib\x64;$(LibraryPath)</LibraryPath>
     <IncludePath>$(SolutionDir)vcpkg_installed\x64-windows-static\x64-windows-static\include;$(SolutionDir)Aegis Unity Universal;$(SolutionDir)Il2cpp_Resolver;C:\Program Files %28x86%29\Microsoft DirectX SDK %28June 2010%29\Include;$(IncludePath)</IncludePath>
-    <OutDir>$(SolutionDir)build\</OutDir>
-    <IntDir>$(SolutionDir)build\intermediate\</IntDir>
+    <OutDir>$(MSBuildProjectDirectory)\..\build\internal\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\..\build\intermediate\internal\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LibraryPath>$(SolutionDir)vcpkg_installed\x64-windows-static\x64-windows-static\lib;C:\Program Files %28x86%29\Microsoft DirectX SDK %28June 2010%29\Lib\x64;$(LibraryPath)</LibraryPath>
     <IncludePath>$(SolutionDir)vcpkg_installed\x64-windows-static\x64-windows-static\include;$(SolutionDir)Il2cpp_Resolver;C:\Program Files %28x86%29\Microsoft DirectX SDK %28June 2010%29\Include;$(SolutionDir)Aegis Unity Universal;$(IncludePath)</IncludePath>
     <TargetName>$(ProjectName)</TargetName>
-    <OutDir>$(SolutionDir)build\</OutDir>
-    <IntDir>$(SolutionDir)build\intermediate\</IntDir>
+    <OutDir>$(MSBuildProjectDirectory)\..\build\internal\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\..\build\intermediate\internal\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <VcpkgUseStatic>true</VcpkgUseStatic>

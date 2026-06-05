@@ -7,6 +7,9 @@
 #include <lua.hpp>
 #include <Utils/Includes.h>
 
+// Opaque IL2CPP type; generated dumps may provide the full definition.
+struct UnityEngine_Shader_o;
+
 namespace Variables
 {
 	inline constexpr const char* AppName = "Aegis Unity Universal";
