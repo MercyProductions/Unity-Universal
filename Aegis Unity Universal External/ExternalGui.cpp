@@ -128,6 +128,16 @@ namespace Aegis::UnityExternal
             std::string source;
         };
 
+        struct MatrixCandidate
+        {
+            uintptr_t address = 0;
+            int layout = 0;
+            int score = 0;
+            int validPoints = 0;
+            int onScreenPoints = 0;
+            std::array<float, 16> matrix{};
+        };
+
         struct GuiState
         {
             GuiTab tab = GuiTab::Universal;
@@ -184,6 +194,8 @@ namespace Aegis::UnityExternal
             int entityLayout = 0;
             int positionOffset = 0;
             char viewProjectionAddress[80] = "";
+            bool autoResolveViewProjection = true;
+            int viewProjectionScanMaxMs = 2500;
             int matrixLayout = 0;
             int upAxis = 0;
             float entityHeight = 1.8f;
@@ -205,6 +217,8 @@ namespace Aegis::UnityExternal
             std::vector<EspEntity> espEntities;
             std::vector<ObjectCacheEntry> objectCache;
             std::string objectCacheStatus;
+            std::string viewProjectionAutoStatus;
+            ULONGLONG viewProjectionLastAutoScanTick = 0;
             std::vector<std::string> log;
         };
 
@@ -214,6 +228,9 @@ namespace Aegis::UnityExternal
         ID3D11RenderTargetView* gRenderTargetView = nullptr;
         HWND gWindow = nullptr;
         constexpr COLORREF kTransparentWindowColorKey = RGB(0, 0, 0);
+
+        bool IsAllowedMemoryType(DWORD type, bool includeImages);
+        bool IsReadableMemoryProtection(DWORD protect);
 
         std::wstring Trim(std::wstring value)
         {
@@ -627,6 +644,17 @@ namespace Aegis::UnityExternal
             return distance >= 0x10000;
         }
 
+        bool IsAddressNear(uintptr_t left, uintptr_t right, uintptr_t distance)
+        {
+            if (left == 0 || right == 0)
+            {
+                return false;
+            }
+
+            const uintptr_t delta = left > right ? left - right : right - left;
+            return delta < distance;
+        }
+
         bool ProbeObjectCachePosition(
             const GuiState& state,
             uintptr_t objectAddress,
@@ -661,17 +689,6 @@ namespace Aegis::UnityExternal
                 }
             }
 
-            for (uintptr_t base : nativeBases)
-            {
-                for (std::size_t offset = 0; offset <= 0x400; offset += alignof(float))
-                {
-                    if (TryReadObjectPositionAt(state, base + offset, position, positionAddress))
-                    {
-                        return true;
-                    }
-                }
-            }
-
             std::vector<uintptr_t> oneHopBases;
             for (uintptr_t base : nativeBases)
             {
@@ -693,6 +710,24 @@ namespace Aegis::UnityExternal
                 if (oneHopBases.size() >= 64)
                 {
                     break;
+                }
+            }
+
+            constexpr std::array<std::size_t, 28> kTransformPositionOffsets = {
+                0x90, 0xA0, 0xAC, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0,
+                0x100, 0x110, 0x120, 0x130, 0x140, 0x150, 0x160, 0x170,
+                0x180, 0x190, 0x1A0, 0x1A4, 0x1A8, 0x1AC, 0x1B0, 0x1C0,
+                0x1D0, 0x1E0, 0x1F0, 0x200
+            };
+
+            for (uintptr_t base : oneHopBases)
+            {
+                for (std::size_t offset : kTransformPositionOffsets)
+                {
+                    if (TryReadObjectPositionAt(state, base + offset, position, positionAddress))
+                    {
+                        return true;
+                    }
                 }
             }
 
@@ -794,6 +829,39 @@ namespace Aegis::UnityExternal
             return TryReadObjectPositionAt(state, readAddress, position, positionAddress);
         }
 
+        bool RefreshObjectCacheEntryPosition(const GuiState& state, ObjectCacheEntry* entry)
+        {
+            if (!entry)
+            {
+                return false;
+            }
+
+            entry->hasPosition = ReadObjectCachePosition(state, entry->address, &entry->position, &entry->positionAddress);
+            if (!entry->hasPosition)
+            {
+                return false;
+            }
+
+            if (entry->matchedPointer != 0 &&
+                IsAddressNear(entry->positionAddress, entry->matchedPointer, 0x1000000))
+            {
+                entry->hasPosition = false;
+                entry->positionAddress = 0;
+                entry->position = {};
+                return false;
+            }
+
+            if (IsAddressNear(entry->positionAddress, entry->address, 0x10000))
+            {
+                entry->hasPosition = false;
+                entry->positionAddress = 0;
+                entry->position = {};
+                return false;
+            }
+
+            return true;
+        }
+
         bool ReadMatrix4x4(const ExternalMemoryReader& reader, const std::string& addressText, std::array<float, 16>* matrix)
         {
             if (!matrix)
@@ -864,6 +932,413 @@ namespace Aegis::UnityExternal
             return head;
         }
 
+        bool IsNearScreen(const ImVec2& point, const ImVec2& screenSize, float marginScale = 0.25f)
+        {
+            const float marginX = std::max(screenSize.x * marginScale, 64.0f);
+            const float marginY = std::max(screenSize.y * marginScale, 64.0f);
+            return point.x >= -marginX &&
+                point.x <= screenSize.x + marginX &&
+                point.y >= -marginY &&
+                point.y <= screenSize.y + marginY;
+        }
+
+        bool IsOnScreen(const ImVec2& point, const ImVec2& screenSize)
+        {
+            return point.x >= 0.0f &&
+                point.x <= screenSize.x &&
+                point.y >= 0.0f &&
+                point.y <= screenSize.y;
+        }
+
+        bool MatrixValuesLookPlausible(const std::array<float, 16>& matrix)
+        {
+            int nonZero = 0;
+            int positive = 0;
+            int negative = 0;
+            float maxAbs = 0.0f;
+            for (float value : matrix)
+            {
+                if (!std::isfinite(value))
+                {
+                    return false;
+                }
+
+                const float absValue = std::abs(value);
+                if (absValue > 100000.0f)
+                {
+                    return false;
+                }
+                if (absValue > 0.0001f)
+                {
+                    ++nonZero;
+                    maxAbs = std::max(maxAbs, absValue);
+                    if (value > 0.0001f)
+                    {
+                        ++positive;
+                    }
+                    else if (value < -0.0001f)
+                    {
+                        ++negative;
+                    }
+                }
+            }
+
+            return nonZero >= 6 && positive > 0 && negative > 0 && maxAbs >= 0.01f;
+        }
+
+        bool AddUniquePositionSample(std::vector<Vec3>* samples, const Vec3& value, std::size_t maxSamples)
+        {
+            if (!samples || samples->size() >= maxSamples)
+            {
+                return false;
+            }
+
+            for (const Vec3& existing : *samples)
+            {
+                const float dx = existing.x - value.x;
+                const float dy = existing.y - value.y;
+                const float dz = existing.z - value.z;
+                if ((dx * dx + dy * dy + dz * dz) < 0.0625f)
+                {
+                    return false;
+                }
+            }
+
+            samples->push_back(value);
+            return true;
+        }
+
+        std::vector<Vec3> ObjectCachePositionSamples(GuiState* state, std::size_t maxSamples)
+        {
+            std::vector<Vec3> samples;
+            if (!state || maxSamples == 0)
+            {
+                return samples;
+            }
+
+            for (ObjectCacheEntry& entry : state->objectCache)
+            {
+                if (!entry.hasPosition)
+                {
+                    RefreshObjectCacheEntryPosition(*state, &entry);
+                }
+
+                if (!entry.hasPosition || !IsPlausibleObjectPosition(*state, entry.position))
+                {
+                    continue;
+                }
+
+                AddUniquePositionSample(&samples, entry.position, maxSamples);
+                if (samples.size() >= maxSamples)
+                {
+                    break;
+                }
+            }
+
+            return samples;
+        }
+
+        MatrixCandidate ScoreViewProjectionMatrix(
+            uintptr_t address,
+            const std::array<float, 16>& matrix,
+            int layout,
+            const std::vector<Vec3>& samples,
+            const ImVec2& screenSize,
+            int upAxis,
+            float entityHeight)
+        {
+            MatrixCandidate candidate;
+            candidate.address = address;
+            candidate.layout = layout;
+            candidate.matrix = matrix;
+
+            if (samples.empty() || screenSize.x <= 1.0f || screenSize.y <= 1.0f)
+            {
+                return candidate;
+            }
+
+            float minX = std::numeric_limits<float>::max();
+            float minY = std::numeric_limits<float>::max();
+            float maxX = std::numeric_limits<float>::lowest();
+            float maxY = std::numeric_limits<float>::lowest();
+            int goodHeightCount = 0;
+
+            for (const Vec3& sample : samples)
+            {
+                ImVec2 feet{};
+                ImVec2 head{};
+                if (!WorldToScreen(sample, matrix, layout, screenSize, &feet) ||
+                    !WorldToScreen(EntityHeadPosition(sample, upAxis, entityHeight), matrix, layout, screenSize, &head))
+                {
+                    continue;
+                }
+
+                if (!std::isfinite(feet.x) || !std::isfinite(feet.y) ||
+                    !std::isfinite(head.x) || !std::isfinite(head.y))
+                {
+                    continue;
+                }
+
+                ++candidate.validPoints;
+                const bool feetNear = IsNearScreen(feet, screenSize);
+                const bool headNear = IsNearScreen(head, screenSize);
+                const bool feetOnScreen = IsOnScreen(feet, screenSize);
+                const bool headOnScreen = IsOnScreen(head, screenSize);
+                if (feetOnScreen || headOnScreen)
+                {
+                    ++candidate.onScreenPoints;
+                }
+
+                const float height = std::abs(feet.y - head.y);
+                if (height >= 6.0f && height <= screenSize.y * 0.95f)
+                {
+                    ++goodHeightCount;
+                }
+
+                if (feetNear || headNear)
+                {
+                    candidate.score += 8;
+                }
+                if (feetOnScreen || headOnScreen)
+                {
+                    candidate.score += 18;
+                }
+                if (height >= 8.0f && height <= screenSize.y * 0.75f)
+                {
+                    candidate.score += 10;
+                }
+                else if (height > screenSize.y * 1.5f)
+                {
+                    candidate.score -= 16;
+                }
+
+                minX = std::min(minX, std::min(feet.x, head.x));
+                minY = std::min(minY, std::min(feet.y, head.y));
+                maxX = std::max(maxX, std::max(feet.x, head.x));
+                maxY = std::max(maxY, std::max(feet.y, head.y));
+            }
+
+            if (candidate.validPoints > 0)
+            {
+                candidate.score += candidate.validPoints * 4;
+            }
+
+            if (candidate.onScreenPoints > 0 && goodHeightCount > 0)
+            {
+                candidate.score += 20;
+            }
+
+            if (candidate.validPoints >= 2)
+            {
+                const float extentX = maxX - minX;
+                const float extentY = maxY - minY;
+                if (extentX < 2.0f && extentY < 2.0f)
+                {
+                    candidate.score -= 24;
+                }
+                else if (extentX <= screenSize.x * 2.0f && extentY <= screenSize.y * 2.0f)
+                {
+                    candidate.score += 8;
+                }
+            }
+
+            return candidate;
+        }
+
+        bool CandidateBeats(const MatrixCandidate& candidate, const MatrixCandidate& best)
+        {
+            if (candidate.score != best.score)
+            {
+                return candidate.score > best.score;
+            }
+
+            if (candidate.onScreenPoints != best.onScreenPoints)
+            {
+                return candidate.onScreenPoints > best.onScreenPoints;
+            }
+
+            return candidate.validPoints > best.validPoints;
+        }
+
+        bool TryAutoConfigureViewProjectionMatrix(
+            GuiState* state,
+            const ImVec2& screenSize,
+            bool force,
+            int maxMilliseconds)
+        {
+            if (!state || !state->reader.IsOpen() || !state->reader.ProcessHandle())
+            {
+                return false;
+            }
+
+            if (!force && !state->autoResolveViewProjection)
+            {
+                return false;
+            }
+
+            if (!force && state->viewProjectionAddress[0])
+            {
+                std::array<float, 16> existing{};
+                if (ReadMatrix4x4(state->reader, state->viewProjectionAddress, &existing))
+                {
+                    return true;
+                }
+            }
+
+            const ULONGLONG now = GetTickCount64();
+            if (!force && state->viewProjectionLastAutoScanTick != 0 &&
+                now - state->viewProjectionLastAutoScanTick < 5000)
+            {
+                return false;
+            }
+            state->viewProjectionLastAutoScanTick = now;
+
+            std::vector<Vec3> samples = ObjectCachePositionSamples(state, 16);
+            if (samples.empty())
+            {
+                state->viewProjectionAutoStatus = "Auto matrix scan skipped: object cache has no readable position samples.";
+                AddLog(state, "%s", state->viewProjectionAutoStatus.c_str());
+                return false;
+            }
+
+            if (samples.size() < 5)
+            {
+                std::ostringstream stream;
+                stream << "Auto matrix scan skipped: only " << samples.size()
+                    << " unique position sample(s); need at least 5 to avoid false camera matrices.";
+                state->viewProjectionAutoStatus = stream.str();
+                AddLog(state, "%s", state->viewProjectionAutoStatus.c_str());
+                return false;
+            }
+
+            const ULONGLONG start = GetTickCount64();
+            const int scanBudgetMs = std::clamp(maxMilliseconds, 250, 30000);
+            constexpr std::size_t kChunkSize = 1024 * 1024;
+            MatrixCandidate best;
+            std::size_t scannedRegions = 0;
+            std::size_t scannedMatrices = 0;
+            bool timedOut = false;
+
+            uintptr_t address = 0;
+            MEMORY_BASIC_INFORMATION mbi{};
+            while (VirtualQueryEx(state->reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
+            {
+                const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                const uintptr_t next = base + mbi.RegionSize;
+                if (next <= base)
+                {
+                    break;
+                }
+
+                if (GetTickCount64() - start > static_cast<ULONGLONG>(scanBudgetMs))
+                {
+                    timedOut = true;
+                    break;
+                }
+
+                if (mbi.State == MEM_COMMIT &&
+                    IsAllowedMemoryType(mbi.Type, false) &&
+                    IsReadableMemoryProtection(mbi.Protect))
+                {
+                    ++scannedRegions;
+                    for (uintptr_t chunkBase = base; chunkBase < next;)
+                    {
+                        const std::size_t chunkSize = static_cast<std::size_t>(std::min<std::uint64_t>(kChunkSize, next - chunkBase));
+                        const std::vector<std::uint8_t> bytes = state->reader.ReadBytes(chunkBase, chunkSize);
+                        if (bytes.size() >= sizeof(float) * 16)
+                        {
+                            for (std::size_t offset = 0; offset + sizeof(float) * 16 <= bytes.size(); offset += 16)
+                            {
+                                std::array<float, 16> matrix{};
+                                std::memcpy(matrix.data(), bytes.data() + offset, sizeof(float) * matrix.size());
+                                if (!MatrixValuesLookPlausible(matrix))
+                                {
+                                    continue;
+                                }
+
+                                ++scannedMatrices;
+                                const uintptr_t candidateAddress = chunkBase + offset;
+                                if (candidateAddress < 0x10000000)
+                                {
+                                    continue;
+                                }
+
+                                MatrixCandidate row = ScoreViewProjectionMatrix(
+                                    candidateAddress,
+                                    matrix,
+                                    0,
+                                    samples,
+                                    screenSize,
+                                    state->upAxis,
+                                    state->entityHeight);
+                                if (CandidateBeats(row, best))
+                                {
+                                    best = row;
+                                }
+
+                                MatrixCandidate column = ScoreViewProjectionMatrix(
+                                    candidateAddress,
+                                    matrix,
+                                    1,
+                                    samples,
+                                    screenSize,
+                                    state->upAxis,
+                                    state->entityHeight);
+                                if (CandidateBeats(column, best))
+                                {
+                                    best = column;
+                                }
+                            }
+                        }
+
+                        const uintptr_t chunkEnd = chunkBase + chunkSize;
+                        if (chunkEnd >= next)
+                        {
+                            break;
+                        }
+                        chunkBase = chunkEnd;
+                    }
+                }
+
+                address = next;
+            }
+
+            if (best.score >= 44 && best.onScreenPoints > 0 && best.validPoints > 0)
+            {
+                CopyToBuffer(state->viewProjectionAddress, sizeof(state->viewProjectionAddress), FormatHex(best.address));
+                state->matrixLayout = best.layout;
+                std::ostringstream stream;
+                stream << "Auto matrix selected " << FormatHex(best.address)
+                    << " (" << (best.layout == 0 ? "row-major" : "column-major")
+                    << ", score " << best.score
+                    << ", points " << best.onScreenPoints << "/" << best.validPoints
+                    << ", samples " << samples.size() << ")";
+                if (timedOut)
+                {
+                    stream << " before scan budget ended";
+                }
+                state->viewProjectionAutoStatus = stream.str();
+                AddLog(state, "%s", state->viewProjectionAutoStatus.c_str());
+                return true;
+            }
+
+            std::ostringstream stream;
+            stream << "Auto matrix scan found no confident matrix"
+                << " (best score " << best.score
+                << ", points " << best.onScreenPoints << "/" << best.validPoints
+                << ", samples " << samples.size()
+                << ", regions " << scannedRegions
+                << ", plausible matrices " << scannedMatrices;
+            if (timedOut)
+            {
+                stream << ", timed out";
+            }
+            stream << ").";
+            state->viewProjectionAutoStatus = stream.str();
+            AddLog(state, "%s", state->viewProjectionAutoStatus.c_str());
+            return false;
+        }
+
         bool ReadEspEntities(GuiState* state, const std::array<float, 16>& matrix, const ImVec2& screenSize)
         {
             if (!state || !state->reader.IsOpen())
@@ -877,8 +1352,7 @@ namespace Aegis::UnityExternal
                 state->espEntities.reserve(state->objectCache.size());
                 for (ObjectCacheEntry& cached : state->objectCache)
                 {
-                    cached.hasPosition = ReadObjectCachePosition(*state, cached.address, &cached.position, &cached.positionAddress);
-                    if (!cached.hasPosition)
+                    if (!RefreshObjectCacheEntryPosition(*state, &cached))
                     {
                         continue;
                     }
@@ -1568,6 +2042,15 @@ namespace Aegis::UnityExternal
                         continue;
                     }
 
+                    if (const std::optional<uintptr_t> cachedPointer =
+                        state.reader.Read<uintptr_t>(OffsetAddress(vtablePointer, state.objectCachedPtrOffset));
+                        cachedPointer &&
+                        IsLikelyUnityNativePointer(vtablePointer, *cachedPointer) &&
+                        IsReadableProcessRange(state.reader.ProcessHandle(), *cachedPointer, sizeof(uintptr_t)))
+                    {
+                        continue;
+                    }
+
                     AddUniqueAddress(&vtablePointers, vtablePointer, 256);
                     if (vtablePointers.size() >= 256)
                     {
@@ -1636,6 +2119,8 @@ namespace Aegis::UnityExternal
 
             state->objectCache.clear();
             state->objectCacheStatus.clear();
+            state->viewProjectionAutoStatus.clear();
+            state->viewProjectionLastAutoScanTick = 0;
 
             if (!state->process ||
                 (state->process->modules.Backend() != RuntimeBackend::Mono &&
@@ -1766,6 +2251,11 @@ namespace Aegis::UnityExternal
                                     continue;
                                 }
 
+                                if (IsAddressNear(chunkBase + offset, matchedTarget->pointer, 0x1000000))
+                                {
+                                    continue;
+                                }
+
                                 if (state->objectCacheRequireCachedPtr)
                                 {
                                     const std::optional<uintptr_t> nativePointer =
@@ -1783,7 +2273,7 @@ namespace Aegis::UnityExternal
                                 entry.matchedPointer = candidate;
                                 entry.label = matchedTarget->label;
                                 entry.source = matchedTarget->source;
-                                entry.hasPosition = ReadObjectCachePosition(*state, entry.address, &entry.position, &entry.positionAddress);
+                                entry.hasPosition = RefreshObjectCacheEntryPosition(*state, &entry);
                                 if (entry.hasPosition)
                                 {
                                     ++positionedCount;
@@ -1810,8 +2300,7 @@ namespace Aegis::UnityExternal
                 state->objectPositionMode = 5;
                 for (ObjectCacheEntry& entry : state->objectCache)
                 {
-                    entry.hasPosition = ReadObjectCachePosition(*state, entry.address, &entry.position, &entry.positionAddress);
-                    if (entry.hasPosition)
+                    if (RefreshObjectCacheEntryPosition(*state, &entry))
                     {
                         ++positionedCount;
                     }
@@ -2018,18 +2507,18 @@ namespace Aegis::UnityExternal
                 state->scanResults.size() == maxResults ? " (truncated)" : "");
         }
 
-        void AlignOverlayToTargetWindow(const GuiState& state)
+        HWND FindTargetWindow(DWORD pid)
         {
-            if (!state.overlayMode || !state.alignToTargetWindow || !state.process)
+            if (pid == 0)
             {
-                return;
+                return nullptr;
             }
 
             struct FindWindowContext
             {
                 DWORD pid = 0;
                 HWND hwnd = nullptr;
-            } context{ state.process->pid, nullptr };
+            } context{ pid, nullptr };
 
             EnumWindows([](HWND hwnd, LPARAM param) -> BOOL {
                 auto* context = reinterpret_cast<FindWindowContext*>(param);
@@ -2051,19 +2540,59 @@ namespace Aegis::UnityExternal
                 return FALSE;
             }, reinterpret_cast<LPARAM>(&context));
 
-            if (!context.hwnd)
+            return context.hwnd;
+        }
+
+        ImVec2 TargetClientSizeOrDefault(const GuiState& state, const ImVec2& fallback)
+        {
+            if (!state.process)
+            {
+                return fallback;
+            }
+
+            HWND targetWindow = FindTargetWindow(state.process->pid);
+            if (!targetWindow)
+            {
+                return fallback;
+            }
+
+            RECT client = {};
+            if (!GetClientRect(targetWindow, &client))
+            {
+                return fallback;
+            }
+
+            const int width = client.right - client.left;
+            const int height = client.bottom - client.top;
+            if (width <= 0 || height <= 0)
+            {
+                return fallback;
+            }
+
+            return ImVec2(static_cast<float>(width), static_cast<float>(height));
+        }
+
+        void AlignOverlayToTargetWindow(const GuiState& state)
+        {
+            if (!state.overlayMode || !state.alignToTargetWindow || !state.process)
+            {
+                return;
+            }
+
+            HWND targetWindow = FindTargetWindow(state.process->pid);
+            if (!targetWindow)
             {
                 return;
             }
 
             RECT client = {};
-            if (!GetClientRect(context.hwnd, &client))
+            if (!GetClientRect(targetWindow, &client))
             {
                 return;
             }
 
             POINT topLeft{ client.left, client.top };
-            ClientToScreen(context.hwnd, &topLeft);
+            ClientToScreen(targetWindow, &topLeft);
             const int width = client.right - client.left;
             const int height = client.bottom - client.top;
             if (width > 0 && height > 0)
@@ -2123,6 +2652,14 @@ namespace Aegis::UnityExternal
 
             const ImVec2 screenSize = ImGui::GetIO().DisplaySize;
             std::array<float, 16> matrix = {};
+            if (!ReadMatrix4x4(state->reader, state->viewProjectionAddress, &matrix) &&
+                state->autoResolveViewProjection &&
+                state->entitySource == 1 &&
+                !state->objectCache.empty())
+            {
+                TryAutoConfigureViewProjectionMatrix(state, screenSize, false, state->viewProjectionScanMaxMs);
+            }
+
             if (!ReadMatrix4x4(state->reader, state->viewProjectionAddress, &matrix))
             {
                 if (state->entitySource == 1 && !state->objectCache.empty())
@@ -2134,6 +2671,13 @@ namespace Aegis::UnityExternal
                         ImVec2(18.0f, 18.0f),
                         noticeColor,
                         "Object cache is active, but ViewProjection Matrix is not configured. Debug lines are not world-to-screen.");
+                    if (!state->viewProjectionAutoStatus.empty())
+                    {
+                        drawList->AddText(
+                            ImVec2(18.0f, 36.0f),
+                            noticeColor,
+                            state->viewProjectionAutoStatus.c_str());
+                    }
 
                     const std::size_t debugCount = std::min<std::size_t>(state->objectCache.size(), 5);
                     for (std::size_t index = 0; index < debugCount; ++index)
@@ -3020,6 +3564,8 @@ namespace Aegis::UnityExternal
                 state->overlayMode = true;
                 state->alignToTargetWindow = true;
                 AddLog(state, "Startup object cache populated; Visual entity source set to object cache.");
+                const ImVec2 targetSize = TargetClientSizeOrDefault(*state, ImVec2(1920.0f, 1080.0f));
+                TryAutoConfigureViewProjectionMatrix(state, targetSize, false, state->viewProjectionScanMaxMs);
             }
             AddLog(state, "Startup setup finished. Opening GUI...");
         }
@@ -3453,6 +3999,18 @@ namespace Aegis::UnityExternal
             ImGui::InputFloat("Max Abs Position", &state->objectPositionMaxAbs, 100.0f, 1000.0f, "%.0f");
 
             ImGui::InputTextWithHint("ViewProjection Matrix", "address of 16-float view-projection matrix", state->viewProjectionAddress, sizeof(state->viewProjectionAddress));
+            ImGui::Checkbox("Auto Find ViewProjection", &state->autoResolveViewProjection);
+            ImGui::SameLine();
+            if (ImGui::Button("Find ViewProjection"))
+            {
+                const ImVec2 screenSize = ImGui::GetIO().DisplaySize;
+                TryAutoConfigureViewProjectionMatrix(state, screenSize, true, std::max(state->viewProjectionScanMaxMs, 8000));
+            }
+            ImGui::InputInt("Matrix Scan Budget MS", &state->viewProjectionScanMaxMs);
+            if (!state->viewProjectionAutoStatus.empty())
+            {
+                ImGui::TextWrapped("%s", state->viewProjectionAutoStatus.c_str());
+            }
             const char* matrixLayouts[] = { "Row-major", "Column-major" };
             ImGui::Combo("Matrix Layout", &state->matrixLayout, matrixLayouts, IM_ARRAYSIZE(matrixLayouts));
             const char* upAxes[] = { "Y Up", "Z Up" };
@@ -4173,12 +4731,21 @@ namespace Aegis::UnityExternal
 
         AutoLoadStartupMethodMap(&state);
         RefreshObjectCache(&state);
+        const ImVec2 targetSize = TargetClientSizeOrDefault(state, ImVec2(1920.0f, 1080.0f));
+        TryAutoConfigureViewProjectionMatrix(&state, targetSize, true, 12000);
 
         std::wcout
             << L"\nObject cache diagnostic\n"
             << L"Target: " << state.process->executable << L" [pid " << state.process->pid << L"]\n"
             << L"Runtime: " << RuntimeBackendName(state.process->modules.Backend()) << L"\n"
-            << L"Status: " << Utf8ToWide(state.objectCacheStatus) << L"\n";
+            << L"Status: " << Utf8ToWide(state.objectCacheStatus) << L"\n"
+            << L"Matrix: " << Utf8ToWide(state.viewProjectionAutoStatus) << L"\n";
+        if (state.viewProjectionAddress[0])
+        {
+            std::wcout
+                << L"Matrix Address: " << Utf8ToWide(state.viewProjectionAddress)
+                << L" [" << (state.matrixLayout == 0 ? L"row-major" : L"column-major") << L"]\n";
+        }
 
         const std::size_t shown = std::min<std::size_t>(state.objectCache.size(), 32);
         for (std::size_t index = 0; index < shown; ++index)

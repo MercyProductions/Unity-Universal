@@ -249,11 +249,13 @@ For IL2CPP, provide an `Il2CppClass*` or object-header class pointer when you al
 
 For Mono, the external can also attempt read-only `MonoClass`/`MonoVTable` discovery by class name. This lets common UnityEngine components such as `UnityEngine.Rigidbody` populate the cache without manually pasting a vtable pointer. The default `MonoClass` name/namespace offsets are `0x30` and `0x38`, and the default `MonoVTable` class pointer offset is `0x0`; these are configurable in Developer for layout differences.
 
-Cached runtime objects can feed the Visual tab. Set `Entity Source` to `Object cache`, configure the position extraction mode/offsets, provide the view-projection matrix address, and enable ESP boxes/snaplines. The overlay re-reads cached object positions every frame before world-to-screen, so boxes can move with the objects once the offsets are correct.
+Cached runtime objects can feed the Visual tab. Set `Entity Source` to `Object cache`, configure the position extraction mode/offsets, provide the view-projection matrix address or enable `Auto Find ViewProjection`, and enable ESP boxes/snaplines. The overlay re-reads cached object positions every frame before world-to-screen, so boxes can move with the objects once the offsets are correct.
 
 If object cache entries exist but no view-projection matrix is configured, the overlay draws clearly labeled debug snaplines. Those lines only prove that the cache is active; real boxes/snaplines at the object's game position still require a valid matrix plus correct position extraction mode/offsets.
 
-The `Auto probe object/native Vec3` position mode is a read-only helper for early testing. It starts from the managed object's `m_CachedPtr`, rejects nearby metadata-looking pointers, and probes nearby native fields plus one-hop native pointers for plausible `Vector3` values. This is useful for confirming the cache can drive overlay lines, but a game-specific Transform/position offset is still the most reliable setup for exact world placement.
+The `Auto probe object/native Vec3` position mode is a read-only helper for early testing. It starts from the managed object's `m_CachedPtr`, rejects nearby metadata-looking pointers, and prioritizes one-hop Transform-like native pointers before accepting plausible `Vector3` values. This is useful for confirming the cache can drive overlay lines, but a game-specific Transform/position offset is still the most reliable setup for exact world placement.
+
+`Auto Find ViewProjection` is also best-effort. It samples cached object positions, scans readable private/mapped memory for plausible 4x4 float matrices, scores row-major and column-major layouts, and fills the matrix address only when the samples are varied enough to avoid obvious false positives. If the console or GUI says there are too few unique position samples, the external is deliberately refusing to guess; use the internal tool, your own game symbols/logs, or a known camera/matrix address to finish that target-specific setup.
 
 Object-cache position modes:
 
