@@ -128,6 +128,25 @@ namespace Aegis::UnityExternal
             std::string source;
         };
 
+        struct FastTrackedTarget
+        {
+            uintptr_t objectAddress = 0;
+            uintptr_t matchedPointer = 0;
+            uintptr_t positionAddress = 0;
+            uintptr_t cachedPtr = 0;
+            std::int64_t objectToPositionOffset = 0;
+            std::int64_t cachedPtrToPositionOffset = 0;
+            std::size_t positionShareCount = 1;
+            Vec3 position;
+            bool hasPosition = false;
+            bool likelyPlayer = false;
+            int score = 0;
+            int staleReads = 0;
+            std::string label;
+            std::string source;
+            std::string offsetSummary;
+        };
+
         struct MatrixCandidate
         {
             uintptr_t address = 0;
@@ -176,6 +195,9 @@ namespace Aegis::UnityExternal
             int il2cppClassNameOffset = 0x10;
             int il2cppClassNamespaceOffset = 0x18;
             int entitySource = 0;
+            bool autoBuildFastTargets = true;
+            bool fastTargetsFallbackToCache = true;
+            int maxFastTargets = 64;
             int objectPositionMode = 5;
             int objectPointerOffset = 0;
             int objectCachedPtrOffset = 0x10;
@@ -221,9 +243,13 @@ namespace Aegis::UnityExternal
             std::vector<ScanResult> scanResults;
             std::vector<EspEntity> espEntities;
             std::vector<ObjectCacheEntry> objectCache;
+            std::vector<FastTrackedTarget> fastTargets;
             std::string objectCacheStatus;
             std::size_t objectCachePositionsReadThisFrame = 0;
             std::size_t objectCachePositionFailuresThisFrame = 0;
+            std::size_t fastTargetsReadThisFrame = 0;
+            std::size_t fastTargetsFallbacksThisFrame = 0;
+            std::size_t fastTargetsFailedThisFrame = 0;
             ULONGLONG objectCacheLastLiveReadTick = 0;
             ULONGLONG objectCacheLastFullScanTick = 0;
             std::string viewProjectionAutoStatus;
@@ -240,6 +266,9 @@ namespace Aegis::UnityExternal
 
         bool IsAllowedMemoryType(DWORD type, bool includeImages);
         bool IsReadableMemoryProtection(DWORD protect);
+        void RebuildFastTargetsFromObjectCache(GuiState* state, bool logResult);
+        void RefreshFastTargetLivePositions(GuiState* state);
+        void RescoreFastTargets(GuiState* state);
 
         std::wstring Trim(std::wstring value)
         {
@@ -433,6 +462,21 @@ namespace Aegis::UnityExternal
             std::ostringstream stream;
             stream << "0x" << std::hex << std::uppercase << value;
             return stream.str();
+        }
+
+        std::string FormatSignedHexOffset(std::int64_t value)
+        {
+            if (value < 0)
+            {
+                return "-" + FormatHex(static_cast<std::uint64_t>(-value));
+            }
+
+            return "+" + FormatHex(static_cast<std::uint64_t>(value));
+        }
+
+        std::int64_t SignedAddressDelta(uintptr_t to, uintptr_t from)
+        {
+            return static_cast<std::int64_t>(to) - static_cast<std::int64_t>(from);
         }
 
         std::string FormatResolvedValue(const ResolvedAddress& resolved)
@@ -1469,6 +1513,7 @@ namespace Aegis::UnityExternal
                 }
                 state->viewProjectionAutoStatus = stream.str();
                 AddLog(state, "%s", state->viewProjectionAutoStatus.c_str());
+                RescoreFastTargets(state);
                 return true;
             }
 
@@ -1501,6 +1546,16 @@ namespace Aegis::UnityExternal
             }
 
             state->espEntities.clear();
+            auto appendEntity = [&](uintptr_t address, const Vec3& position) {
+                EspEntity entity;
+                entity.address = address;
+                entity.position = position;
+                entity.onScreen = WorldToScreen(position, matrix, state->matrixLayout, screenSize, &entity.screen);
+                entity.onScreen = WorldToScreen(EntityHeadPosition(position, state->upAxis, state->entityHeight), matrix, state->matrixLayout, screenSize, &entity.head)
+                    && entity.onScreen;
+                state->espEntities.push_back(entity);
+            };
+
             if (state->entitySource == 1)
             {
                 RefreshObjectCacheLivePositions(state);
@@ -1512,14 +1567,42 @@ namespace Aegis::UnityExternal
                         continue;
                     }
 
-                    EspEntity entity;
-                    entity.address = cached.address;
-                    entity.position = cached.position;
-                    entity.onScreen = WorldToScreen(cached.position, matrix, state->matrixLayout, screenSize, &entity.screen);
-                    entity.onScreen = WorldToScreen(EntityHeadPosition(cached.position, state->upAxis, state->entityHeight), matrix, state->matrixLayout, screenSize, &entity.head)
-                        && entity.onScreen;
-                    state->espEntities.push_back(entity);
+                    appendEntity(cached.address, cached.position);
                 }
+                return !state->espEntities.empty();
+            }
+
+            if (state->entitySource == 2)
+            {
+                if (state->fastTargets.empty() && state->autoBuildFastTargets && !state->objectCache.empty())
+                {
+                    RebuildFastTargetsFromObjectCache(state, false);
+                }
+
+                RefreshFastTargetLivePositions(state);
+                state->espEntities.reserve(state->fastTargets.size());
+                for (const FastTrackedTarget& target : state->fastTargets)
+                {
+                    if (!target.hasPosition)
+                    {
+                        continue;
+                    }
+
+                    appendEntity(target.objectAddress, target.position);
+                }
+
+                if (state->espEntities.empty() && state->fastTargetsFallbackToCache && !state->objectCache.empty())
+                {
+                    RefreshObjectCacheLivePositions(state);
+                    for (ObjectCacheEntry& cached : state->objectCache)
+                    {
+                        if (cached.hasPosition)
+                        {
+                            appendEntity(cached.address, cached.position);
+                        }
+                    }
+                }
+
                 return !state->espEntities.empty();
             }
 
@@ -2313,6 +2396,10 @@ namespace Aegis::UnityExternal
             state->objectCachePositionsReadThisFrame = 0;
             state->objectCachePositionFailuresThisFrame = 0;
             state->objectCache.clear();
+            state->fastTargets.clear();
+            state->fastTargetsReadThisFrame = 0;
+            state->fastTargetsFallbacksThisFrame = 0;
+            state->fastTargetsFailedThisFrame = 0;
             state->objectCacheStatus.clear();
             state->viewProjectionAutoStatus.clear();
             state->viewProjectionLastAutoScanTick = 0;
@@ -2532,6 +2619,380 @@ namespace Aegis::UnityExternal
             if (targets.size() > loggedTargets)
             {
                 AddLog(state, "  ... %zu more target pointer(s)", targets.size() - loggedTargets);
+            }
+        }
+
+        void UpdateFastTargetOffsets(const GuiState& state, FastTrackedTarget* target)
+        {
+            if (!target)
+            {
+                return;
+            }
+
+            target->objectToPositionOffset = SignedAddressDelta(target->positionAddress, target->objectAddress);
+            target->cachedPtr = 0;
+            target->cachedPtrToPositionOffset = 0;
+
+            if (const std::optional<uintptr_t> cachedPtr =
+                state.reader.Read<uintptr_t>(OffsetAddress(target->objectAddress, state.objectCachedPtrOffset));
+                cachedPtr && IsLikelyUnityNativePointer(target->objectAddress, *cachedPtr))
+            {
+                target->cachedPtr = *cachedPtr;
+                target->cachedPtrToPositionOffset = SignedAddressDelta(target->positionAddress, *cachedPtr);
+            }
+
+            std::ostringstream stream;
+            stream << "pos " << FormatHex(target->positionAddress)
+                << ", object" << FormatSignedHexOffset(target->objectToPositionOffset);
+            if (target->cachedPtr != 0)
+            {
+                stream << ", m_CachedPtr " << FormatHex(target->cachedPtr)
+                    << FormatSignedHexOffset(target->cachedPtrToPositionOffset);
+            }
+            if (target->positionShareCount > 1)
+            {
+                stream << ", shared x" << target->positionShareCount;
+            }
+            target->offsetSummary = stream.str();
+        }
+
+        int ScoreFastTargetCandidate(const GuiState& state, const FastTrackedTarget& target)
+        {
+            int score = 0;
+            if (target.hasPosition)
+            {
+                score += 30;
+            }
+
+            if (target.positionShareCount <= 1)
+            {
+                score += 8;
+            }
+            else
+            {
+                score -= static_cast<int>(std::min<std::size_t>((target.positionShareCount - 1) * 6, 48));
+            }
+
+            const auto absOffset = [](std::int64_t value) -> std::uint64_t {
+                return value < 0
+                    ? static_cast<std::uint64_t>(-value)
+                    : static_cast<std::uint64_t>(value);
+            };
+
+            if (target.positionAddress < 0x10000000)
+            {
+                score -= 45;
+            }
+
+            const std::uint64_t objectOffsetAbs = absOffset(target.objectToPositionOffset);
+            if (objectOffsetAbs <= 0x10000)
+            {
+                score += 25;
+            }
+            else if (objectOffsetAbs <= 0x100000)
+            {
+                score += 12;
+            }
+            else
+            {
+                score -= 18;
+            }
+
+            if (target.cachedPtr != 0)
+            {
+                const std::uint64_t cachedPtrOffsetAbs = absOffset(target.cachedPtrToPositionOffset);
+                if (cachedPtrOffsetAbs <= 0x400)
+                {
+                    score += 30;
+                }
+                else if (cachedPtrOffsetAbs <= 0x10000)
+                {
+                    score += 12;
+                }
+                else
+                {
+                    score -= 12;
+                }
+            }
+
+            if (ContainsInsensitiveAscii(target.label, "player"))
+            {
+                score += 80;
+            }
+            if (ContainsInsensitiveAscii(target.label, "character"))
+            {
+                score += 55;
+            }
+            if (ContainsInsensitiveAscii(target.label, "controller"))
+            {
+                score += 45;
+            }
+            if (ContainsInsensitiveAscii(target.label, "local"))
+            {
+                score += 30;
+            }
+            if (ContainsInsensitiveAscii(target.label, "rigidbody"))
+            {
+                score += 10;
+            }
+
+            const float horizontalMagnitude =
+                state.upAxis == 1
+                ? std::sqrt(target.position.x * target.position.x + target.position.y * target.position.y)
+                : std::sqrt(target.position.x * target.position.x + target.position.z * target.position.z);
+            if (std::isfinite(horizontalMagnitude) && horizontalMagnitude <= 500.0f)
+            {
+                score += 10;
+            }
+
+            const float vertical =
+                state.upAxis == 1
+                ? target.position.z
+                : target.position.y;
+            if (std::isfinite(vertical) && vertical >= -10.0f && vertical <= 50.0f)
+            {
+                score += 12;
+            }
+
+            std::array<float, 16> matrix{};
+            if (ReadMatrix4x4(state.reader, state.viewProjectionAddress, &matrix))
+            {
+                const ImVec2 screenSize =
+                    ImGui::GetCurrentContext()
+                    ? ImGui::GetIO().DisplaySize
+                    : ImVec2(1920.0f, 1080.0f);
+                ImVec2 feet{};
+                ImVec2 head{};
+                if (WorldToScreen(target.position, matrix, state.matrixLayout, screenSize, &feet) &&
+                    WorldToScreen(EntityHeadPosition(target.position, state.upAxis, state.entityHeight), matrix, state.matrixLayout, screenSize, &head))
+                {
+                    score += 25;
+                    if (IsOnScreen(feet, screenSize) || IsOnScreen(head, screenSize))
+                    {
+                        score += 30;
+                    }
+
+                    const float centerDx = (feet.x - screenSize.x * 0.5f) / std::max(screenSize.x, 1.0f);
+                    const float centerDy = (feet.y - screenSize.y * 0.5f) / std::max(screenSize.y, 1.0f);
+                    const float centerDistance = std::sqrt(centerDx * centerDx + centerDy * centerDy);
+                    if (std::isfinite(centerDistance))
+                    {
+                        score += static_cast<int>(std::clamp(0.45f - centerDistance, 0.0f, 0.45f) * 80.0f);
+                    }
+
+                    const float height = std::abs(feet.y - head.y);
+                    if (height >= 8.0f && height <= screenSize.y * 0.8f)
+                    {
+                        score += 18;
+                    }
+                }
+            }
+
+            return score;
+        }
+
+        void RescoreFastTargets(GuiState* state)
+        {
+            if (!state || state->fastTargets.empty())
+            {
+                return;
+            }
+
+            for (FastTrackedTarget& target : state->fastTargets)
+            {
+                target.score = ScoreFastTargetCandidate(*state, target);
+                target.likelyPlayer = false;
+            }
+
+            std::sort(state->fastTargets.begin(), state->fastTargets.end(), [](const FastTrackedTarget& left, const FastTrackedTarget& right) {
+                if (left.score != right.score)
+                {
+                    return left.score > right.score;
+                }
+                if (left.positionShareCount != right.positionShareCount)
+                {
+                    return left.positionShareCount < right.positionShareCount;
+                }
+                return left.positionAddress < right.positionAddress;
+            });
+
+            state->fastTargets.front().likelyPlayer = true;
+        }
+
+        bool AddUniqueFastTarget(std::vector<FastTrackedTarget>* targets, FastTrackedTarget target, std::size_t maxTargets)
+        {
+            if (!targets || target.positionAddress == 0 || target.objectAddress == 0 || targets->size() >= maxTargets)
+            {
+                return false;
+            }
+
+            for (const FastTrackedTarget& existing : *targets)
+            {
+                if (existing.positionAddress == target.positionAddress ||
+                    existing.objectAddress == target.objectAddress)
+                {
+                    return false;
+                }
+            }
+
+            targets->push_back(std::move(target));
+            return true;
+        }
+
+        void RebuildFastTargetsFromObjectCache(GuiState* state, bool logResult)
+        {
+            if (!state)
+            {
+                return;
+            }
+
+            state->fastTargets.clear();
+            const std::size_t maxTargets = static_cast<std::size_t>(std::clamp(state->maxFastTargets, 1, 4096));
+            for (ObjectCacheEntry& entry : state->objectCache)
+            {
+                if (!entry.hasPosition)
+                {
+                    RefreshObjectCacheEntryPosition(*state, &entry);
+                }
+            }
+
+            const auto positionShareCount = [&](uintptr_t positionAddress) -> std::size_t {
+                return static_cast<std::size_t>(std::count_if(state->objectCache.begin(), state->objectCache.end(), [&](const ObjectCacheEntry& entry) {
+                    return entry.hasPosition && entry.positionAddress == positionAddress;
+                }));
+            };
+
+            for (const ObjectCacheEntry& entry : state->objectCache)
+            {
+                if (!entry.hasPosition || entry.positionAddress == 0)
+                {
+                    continue;
+                }
+
+                FastTrackedTarget target;
+                target.objectAddress = entry.address;
+                target.matchedPointer = entry.matchedPointer;
+                target.positionAddress = entry.positionAddress;
+                target.position = entry.position;
+                target.hasPosition = true;
+                target.positionShareCount = std::max<std::size_t>(positionShareCount(entry.positionAddress), 1);
+                target.label = entry.label;
+                target.source = "fast target from " + entry.source;
+                UpdateFastTargetOffsets(*state, &target);
+                target.score = ScoreFastTargetCandidate(*state, target);
+                AddUniqueFastTarget(&state->fastTargets, std::move(target), maxTargets);
+            }
+
+            RescoreFastTargets(state);
+
+            if (logResult)
+            {
+                AddLog(
+                    state,
+                    "Built %zu fast tracked target(s) from object cache%s.",
+                    state->fastTargets.size(),
+                    state->fastTargets.empty() ? "" : "; highest score marked likely player");
+            }
+        }
+
+        void UpdateFastTargetFromEntry(const GuiState& state, const ObjectCacheEntry& entry, FastTrackedTarget* target)
+        {
+            if (!target)
+            {
+                return;
+            }
+
+            target->objectAddress = entry.address;
+            target->matchedPointer = entry.matchedPointer;
+            target->positionAddress = entry.positionAddress;
+            target->position = entry.position;
+            target->hasPosition = entry.hasPosition;
+            target->positionShareCount = 1;
+            target->label = entry.label;
+            target->source = "fast target from " + entry.source;
+            target->staleReads = 0;
+            UpdateFastTargetOffsets(state, target);
+            target->score = ScoreFastTargetCandidate(state, *target);
+        }
+
+        enum class FastTargetReadResult
+        {
+            Direct,
+            Fallback,
+            Failed
+        };
+
+        FastTargetReadResult RefreshFastTargetPosition(GuiState* state, FastTrackedTarget* target)
+        {
+            if (!state || !target || target->positionAddress == 0)
+            {
+                return FastTargetReadResult::Failed;
+            }
+
+            bool objectHeaderMatches = true;
+            if (target->matchedPointer != 0 && target->objectAddress != 0)
+            {
+                const std::optional<uintptr_t> header = state->reader.Read<uintptr_t>(target->objectAddress);
+                objectHeaderMatches = header && *header == target->matchedPointer;
+            }
+
+            uintptr_t directPositionAddress = target->positionAddress;
+            Vec3 position{};
+            uintptr_t readAddress = 0;
+            if (objectHeaderMatches &&
+                TryReadObjectPositionAt(*state, directPositionAddress, &position, &readAddress))
+            {
+                target->position = position;
+                target->positionAddress = readAddress;
+                target->hasPosition = true;
+                target->staleReads = 0;
+                return FastTargetReadResult::Direct;
+            }
+
+            if (state->fastTargetsFallbackToCache && target->objectAddress != 0)
+            {
+                ObjectCacheEntry fallback;
+                fallback.address = target->objectAddress;
+                fallback.matchedPointer = target->matchedPointer;
+                fallback.label = target->label;
+                fallback.source = "fast-target fallback";
+                if (RefreshObjectCacheEntryPosition(*state, &fallback))
+                {
+                    UpdateFastTargetFromEntry(*state, fallback, target);
+                    return FastTargetReadResult::Fallback;
+                }
+            }
+
+            target->hasPosition = false;
+            ++target->staleReads;
+            return FastTargetReadResult::Failed;
+        }
+
+        void RefreshFastTargetLivePositions(GuiState* state)
+        {
+            if (!state)
+            {
+                return;
+            }
+
+            state->fastTargetsReadThisFrame = 0;
+            state->fastTargetsFallbacksThisFrame = 0;
+            state->fastTargetsFailedThisFrame = 0;
+            for (FastTrackedTarget& target : state->fastTargets)
+            {
+                switch (RefreshFastTargetPosition(state, &target))
+                {
+                case FastTargetReadResult::Direct:
+                    ++state->fastTargetsReadThisFrame;
+                    break;
+                case FastTargetReadResult::Fallback:
+                    ++state->fastTargetsReadThisFrame;
+                    ++state->fastTargetsFallbacksThisFrame;
+                    break;
+                case FastTargetReadResult::Failed:
+                    ++state->fastTargetsFailedThisFrame;
+                    break;
+                }
             }
         }
 
@@ -2840,7 +3301,8 @@ namespace Aegis::UnityExternal
 
         void MaybeAutoRebuildObjectCache(GuiState* state)
         {
-            if (!state || !state->objectCacheAutoRebuild || state->entitySource != 1 ||
+            if (!state || !state->objectCacheAutoRebuild ||
+                (state->entitySource != 1 && state->entitySource != 2) ||
                 !state->process || !state->reader.IsOpen())
             {
                 return;
@@ -2857,6 +3319,10 @@ namespace Aegis::UnityExternal
 
             AddLog(state, "Auto rebuilding object cache after %llu ms.", interval);
             RefreshObjectCache(state);
+            if (state->autoBuildFastTargets)
+            {
+                RebuildFastTargetsFromObjectCache(state, true);
+            }
         }
 
         void DrawExternalEspOverlay(GuiState* state)
@@ -2872,7 +3338,7 @@ namespace Aegis::UnityExternal
             std::array<float, 16> matrix = {};
             if (!ReadMatrix4x4(state->reader, state->viewProjectionAddress, &matrix) &&
                 state->autoResolveViewProjection &&
-                state->entitySource == 1 &&
+                (state->entitySource == 1 || state->entitySource == 2) &&
                 !state->objectCache.empty())
             {
                 TryAutoConfigureViewProjectionMatrix(state, screenSize, false, state->viewProjectionScanMaxMs);
@@ -2880,16 +3346,28 @@ namespace Aegis::UnityExternal
 
             if (!ReadMatrix4x4(state->reader, state->viewProjectionAddress, &matrix))
             {
-                if (state->entitySource == 1 && !state->objectCache.empty())
+                const bool hasCacheDebug = state->entitySource == 1 && !state->objectCache.empty();
+                const bool hasFastDebug = state->entitySource == 2 && !state->fastTargets.empty();
+                if (hasCacheDebug || hasFastDebug)
                 {
-                    RefreshObjectCacheLivePositions(state);
+                    if (hasFastDebug)
+                    {
+                        RefreshFastTargetLivePositions(state);
+                    }
+                    else
+                    {
+                        RefreshObjectCacheLivePositions(state);
+                    }
+
                     ImDrawList* drawList = ImGui::GetForegroundDrawList();
                     const ImU32 noticeColor = IM_COL32(255, 206, 92, 235);
                     const ImU32 lineColor = IM_COL32(255, 206, 92, 160);
                     drawList->AddText(
                         ImVec2(18.0f, 18.0f),
                         noticeColor,
-                        "Object cache is active, but ViewProjection Matrix is not configured. Debug lines are not world-to-screen.");
+                        hasFastDebug
+                        ? "Fast targets are active, but ViewProjection Matrix is not configured. Debug lines are not world-to-screen."
+                        : "Object cache is active, but ViewProjection Matrix is not configured. Debug lines are not world-to-screen.");
                     if (!state->viewProjectionAutoStatus.empty())
                     {
                         drawList->AddText(
@@ -2898,14 +3376,18 @@ namespace Aegis::UnityExternal
                             state->viewProjectionAutoStatus.c_str());
                     }
 
-                    const std::size_t debugCount = std::min<std::size_t>(state->objectCache.size(), 5);
+                    const std::size_t debugCount = hasFastDebug
+                        ? std::min<std::size_t>(state->fastTargets.size(), 5)
+                        : std::min<std::size_t>(state->objectCache.size(), 5);
                     for (std::size_t index = 0; index < debugCount; ++index)
                     {
-                        const ObjectCacheEntry& entry = state->objectCache[index];
+                        const std::string label = hasFastDebug
+                            ? (state->fastTargets[index].likelyPlayer ? "* " + state->fastTargets[index].label : state->fastTargets[index].label)
+                            : state->objectCache[index].label;
                         const ImVec2 marker(80.0f + static_cast<float>(index) * 140.0f, 58.0f);
                         drawList->AddLine(ImVec2(screenSize.x * 0.5f, screenSize.y), marker, lineColor, 1.0f);
                         drawList->AddCircleFilled(marker, 4.0f, noticeColor, 12);
-                        drawList->AddText(ImVec2(marker.x + 7.0f, marker.y - 8.0f), noticeColor, entry.label.c_str());
+                        drawList->AddText(ImVec2(marker.x + 7.0f, marker.y - 8.0f), noticeColor, label.c_str());
                     }
                 }
                 return;
@@ -3263,6 +3745,16 @@ namespace Aegis::UnityExternal
             state->process = std::move(process);
             state->reader.Close();
             const bool hasReadAccess = state->reader.Open(state->process->pid);
+            state->objectCache.clear();
+            state->fastTargets.clear();
+            state->espEntities.clear();
+            state->objectCacheStatus.clear();
+            state->viewProjectionAutoStatus.clear();
+            state->objectCachePositionsReadThisFrame = 0;
+            state->objectCachePositionFailuresThisFrame = 0;
+            state->fastTargetsReadThisFrame = 0;
+            state->fastTargetsFallbacksThisFrame = 0;
+            state->fastTargetsFailedThisFrame = 0;
             state->resolver.emplace(state->process->modules);
             if (state->methodMap)
             {
@@ -3777,12 +4269,19 @@ namespace Aegis::UnityExternal
             RefreshObjectCache(state);
             if (!state->objectCache.empty())
             {
-                state->entitySource = 1;
+                if (state->autoBuildFastTargets)
+                {
+                    RebuildFastTargetsFromObjectCache(state, true);
+                }
+                state->entitySource = state->fastTargets.empty() ? 1 : 2;
                 state->espEnabled = true;
                 state->espSnaplines = true;
                 state->overlayMode = true;
                 state->alignToTargetWindow = true;
-                AddLog(state, "Startup object cache populated; Visual entity source set to object cache.");
+                AddLog(
+                    state,
+                    "Startup object cache populated; Visual entity source set to %s.",
+                    state->entitySource == 2 ? "fast tracked positions" : "object cache");
                 const ImVec2 targetSize = TargetClientSizeOrDefault(*state, ImVec2(1920.0f, 1080.0f));
                 TryAutoConfigureViewProjectionMatrix(state, targetSize, false, state->viewProjectionScanMaxMs);
             }
@@ -4187,11 +4686,15 @@ namespace Aegis::UnityExternal
             ImGui::SameLine();
             ImGui::Checkbox("Radar", &state->radarEnabled);
 
-            const char* entitySources[] = { "Manual entity list", "Object cache" };
+            const char* entitySources[] = { "Manual entity list", "Object cache", "Fast tracked positions" };
             ImGui::Combo("Entity Source", &state->entitySource, entitySources, IM_ARRAYSIZE(entitySources));
             if (state->entitySource == 1)
             {
                 ImGui::TextWrapped("Object cache source re-reads cached object positions every rendered frame. Full cache rebuilds for newly spawned/despawned objects are configured in Developer.");
+            }
+            else if (state->entitySource == 2)
+            {
+                ImGui::TextWrapped("Fast tracked positions read pinned Vec3 addresses first and use object-cache probing only as a stale-target fallback.");
             }
 
             ImGui::InputTextWithHint("Entity List", "pointer array or first entity address", state->entityListAddress, sizeof(state->entityListAddress));
@@ -4253,6 +4756,14 @@ namespace Aegis::UnityExternal
                     "Live cache positions: %zu ok / %zu failed",
                     state->objectCachePositionsReadThisFrame,
                     state->objectCachePositionFailuresThisFrame);
+            }
+            else if (state->entitySource == 2)
+            {
+                ImGui::Text(
+                    "Fast targets: %zu direct/fallback ok / %zu fallback / %zu failed",
+                    state->fastTargetsReadThisFrame,
+                    state->fastTargetsFallbacksThisFrame,
+                    state->fastTargetsFailedThisFrame);
             }
 
             ImGui::Separator();
@@ -4617,6 +5128,10 @@ namespace Aegis::UnityExternal
             ImGui::Checkbox("Auto Rebuild Cache", &state->objectCacheAutoRebuild);
             ImGui::SameLine();
             ImGui::InputInt("Rebuild Interval MS", &state->objectCacheAutoRebuildMs);
+            ImGui::Checkbox("Auto Build Fast Targets", &state->autoBuildFastTargets);
+            ImGui::SameLine();
+            ImGui::Checkbox("Fast Targets Cache Fallback", &state->fastTargetsFallbackToCache);
+            ImGui::InputInt("Max Fast Targets", &state->maxFastTargets);
             ImGui::InputInt("MonoClass name offset", &state->monoClassNameOffset);
             ImGui::InputInt("MonoClass namespace offset", &state->monoClassNamespaceOffset);
             ImGui::InputInt("MonoVTable class offset", &state->monoVTableClassOffset);
@@ -4630,15 +5145,31 @@ namespace Aegis::UnityExternal
             if (ImGui::Button("Refresh Object Cache"))
             {
                 RefreshObjectCache(state);
+                if (state->autoBuildFastTargets)
+                {
+                    RebuildFastTargetsFromObjectCache(state, true);
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Build Fast Targets"))
+            {
+                RebuildFastTargetsFromObjectCache(state, true);
             }
             ImGui::SameLine();
             if (ImGui::Button("Draw Cache In Visual"))
             {
-                state->entitySource = 1;
+                if (state->fastTargets.empty() && state->autoBuildFastTargets)
+                {
+                    RebuildFastTargetsFromObjectCache(state, true);
+                }
+                state->entitySource = state->fastTargets.empty() ? 1 : 2;
                 state->espEnabled = true;
                 state->espBoxes = true;
                 state->espSnaplines = true;
-                AddLog(state, "Visual entity source set to object cache.");
+                AddLog(
+                    state,
+                    "Visual entity source set to %s.",
+                    state->entitySource == 2 ? "fast tracked positions" : "object cache");
             }
             if (!state->objectCacheStatus.empty())
             {
@@ -4648,6 +5179,59 @@ namespace Aegis::UnityExternal
                 "Live position reads: %zu ok / %zu failed",
                 state->objectCachePositionsReadThisFrame,
                 state->objectCachePositionFailuresThisFrame);
+            ImGui::Text(
+                "Fast target reads: %zu ok / %zu fallback / %zu failed",
+                state->fastTargetsReadThisFrame,
+                state->fastTargetsFallbacksThisFrame,
+                state->fastTargetsFailedThisFrame);
+            if (ImGui::BeginTable("##FastTargetTable", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 130)))
+            {
+                ImGui::TableSetupColumn("Likely", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("Object", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                ImGui::TableSetupColumn("Position", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                ImGui::TableSetupColumn("Vec3");
+                ImGui::TableSetupColumn("Offsets");
+                ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                ImGui::TableHeadersRow();
+                for (std::size_t index = 0; index < state->fastTargets.size(); ++index)
+                {
+                    const FastTrackedTarget& target = state->fastTargets[index];
+                    ImGui::PushID(static_cast<int>(index));
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(target.likelyPlayer ? "yes" : "");
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(target.label.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(FormatHex(target.objectAddress).c_str());
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::TextUnformatted(FormatHex(target.positionAddress).c_str());
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%d", target.score);
+                    ImGui::TableSetColumnIndex(5);
+                    if (target.hasPosition)
+                    {
+                        ImGui::Text("%.2f, %.2f, %.2f", target.position.x, target.position.y, target.position.z);
+                    }
+                    else
+                    {
+                        ImGui::TextDisabled("stale");
+                    }
+                    ImGui::TableSetColumnIndex(6);
+                    ImGui::TextUnformatted(target.offsetSummary.c_str());
+                    ImGui::TableSetColumnIndex(7);
+                    if (ImGui::SmallButton("Use"))
+                    {
+                        CopyToBuffer(state->readAddress, sizeof(state->readAddress), FormatHex(target.positionAddress));
+                        CopyToBuffer(state->watchAddress, sizeof(state->watchAddress), FormatHex(target.positionAddress));
+                        CopyToBuffer(state->localPositionAddress, sizeof(state->localPositionAddress), FormatHex(target.positionAddress));
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
             if (ImGui::BeginTable("##ObjectCacheTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 140)))
             {
                 ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 140.0f);
@@ -4972,6 +5556,7 @@ namespace Aegis::UnityExternal
 
         AutoLoadStartupMethodMap(&state);
         RefreshObjectCache(&state);
+        RebuildFastTargetsFromObjectCache(&state, true);
         const ImVec2 targetSize = TargetClientSizeOrDefault(state, ImVec2(1920.0f, 1080.0f));
         TryAutoConfigureViewProjectionMatrix(&state, targetSize, true, 12000);
 
@@ -4986,6 +5571,25 @@ namespace Aegis::UnityExternal
             std::wcout
                 << L"Matrix Address: " << Utf8ToWide(state.viewProjectionAddress)
                 << L" [" << (state.matrixLayout == 0 ? L"row-major" : L"column-major") << L"]\n";
+        }
+
+        const std::size_t fastShown = std::min<std::size_t>(state.fastTargets.size(), 16);
+        for (std::size_t index = 0; index < fastShown; ++index)
+        {
+            const FastTrackedTarget& targetEntry = state.fastTargets[index];
+            std::wcout
+                << L"  fast[" << index << L"] "
+                << (targetEntry.likelyPlayer ? L"likely " : L"")
+                << Utf8ToWide(targetEntry.label)
+                << L" score=" << targetEntry.score
+                << L" object=" << Utf8ToWide(FormatHex(targetEntry.objectAddress))
+                << L" pos@" << Utf8ToWide(FormatHex(targetEntry.positionAddress))
+                << L" offsets=" << Utf8ToWide(targetEntry.offsetSummary)
+                << L"\n";
+        }
+        if (state.fastTargets.size() > fastShown)
+        {
+            std::wcout << L"  ... " << (state.fastTargets.size() - fastShown) << L" more fast target(s)\n";
         }
 
         const std::size_t shown = std::min<std::size_t>(state.objectCache.size(), 32);

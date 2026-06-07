@@ -253,6 +253,10 @@ Cached runtime objects can feed the Visual tab. Set `Entity Source` to `Object c
 
 Full object-cache discovery is separate from live movement updates. A full scan walks target process memory to find matching Mono/IL2CPP object candidates, so it can be expensive on large games. Use `Refresh Object Cache` when changing component names or offsets. Enable `Auto Rebuild Cache` only when you need periodic spawn/despawn discovery; the interval is clamped to avoid accidentally running heavyweight scans every frame.
 
+After discovery, the external can build `Fast tracked positions`. This promotes cached objects with readable positions into direct Vec3 reads using the exact position address discovered during probing. The fast target table shows a likely-player heuristic, score, object address, position address, inferred offsets such as object-relative and `m_CachedPtr`-relative deltas, and whether many cached objects share the same position read. The likely-player marker is only a heuristic for debugging and identification; verify it against your own scene and component names.
+
+When `Entity Source` is `Fast tracked positions`, rendering reads those pinned Vec3 addresses first. If a direct read fails or the object header no longer matches the discovered Mono/IL2CPP pointer, the external can fall back to object-cache probing for that target. If an object is destroyed and replaced with a new object, use `Auto Rebuild Cache` or manually refresh discovery so the fast target list can be rebuilt from current objects.
+
 If object cache entries exist but no view-projection matrix is configured, the overlay draws clearly labeled debug snaplines. Those lines only prove that the cache is active; real boxes/snaplines at the object's game position still require a valid matrix plus correct position extraction mode/offsets.
 
 The `Auto probe object/native Vec3` position mode is a read-only helper for early testing. It starts from the managed object's `m_CachedPtr`, rejects nearby metadata-looking pointers, and prioritizes one-hop Transform-like native pointers before accepting plausible `Vector3` values. This is useful for confirming the cache can drive overlay lines, but a game-specific Transform/position offset is still the most reliable setup for exact world placement.
@@ -330,8 +334,8 @@ For a game you own or are authorized to inspect:
 8. For runtime object-cache ESP, start with the default `UnityEngine.Rigidbody` test component or enter your own component name such as `PlayerController`.
 9. On Mono, provide the matching object/vtable pointer(s). On IL2CPP, leave `Auto Resolve IL2CPP Class Pointers` enabled or provide the matching `Il2CppClass*`/header pointer(s) manually.
 10. Refresh the cache, then click `Draw Cache In Visual`.
-11. In Visual, set `Entity Source` to `Object cache`, enable `Draw Visuals`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen. If there are fewer than five unique objects, leave `Few-Sample Matrix Guess` enabled to let the external try the lower-confidence matrix scan.
-12. Watch `Live cache positions` in Visual or `Live position reads` in Developer. Those counters should update every frame while boxes/snaplines/radar are active; use `Auto Rebuild Cache` only for periodic full rediscovery of spawned/despawned objects.
+11. In Visual, set `Entity Source` to `Fast tracked positions` when available, enable `Draw Visuals`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen. If there are fewer than five unique objects, leave `Few-Sample Matrix Guess` enabled to let the external try the lower-confidence matrix scan.
+12. Watch `Fast targets` in Visual or the fast target table in Developer. Those counters should update every frame while boxes/snaplines/radar are active; use `Auto Rebuild Cache` only for periodic full rediscovery of spawned/despawned objects.
 13. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, Mono object/vtable pointer, IL2CPP class pointer, or native position offsets.
 14. Use manual external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
 
