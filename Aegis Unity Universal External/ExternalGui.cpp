@@ -189,6 +189,8 @@ namespace Aegis::UnityExternal
             bool espBoxes = true;
             bool espSnaplines = true;
             bool radarEnabled = false;
+            bool objectCacheAutoRebuild = false;
+            int objectCacheAutoRebuildMs = 30000;
             char entityListAddress[80] = "";
             char entityCountAddress[80] = "";
             int entityCount = 32;
@@ -220,6 +222,10 @@ namespace Aegis::UnityExternal
             std::vector<EspEntity> espEntities;
             std::vector<ObjectCacheEntry> objectCache;
             std::string objectCacheStatus;
+            std::size_t objectCachePositionsReadThisFrame = 0;
+            std::size_t objectCachePositionFailuresThisFrame = 0;
+            ULONGLONG objectCacheLastLiveReadTick = 0;
+            ULONGLONG objectCacheLastFullScanTick = 0;
             std::string viewProjectionAutoStatus;
             ULONGLONG viewProjectionLastAutoScanTick = 0;
             std::vector<std::string> log;
@@ -865,6 +871,29 @@ namespace Aegis::UnityExternal
             return true;
         }
 
+        void RefreshObjectCacheLivePositions(GuiState* state)
+        {
+            if (!state)
+            {
+                return;
+            }
+
+            state->objectCachePositionsReadThisFrame = 0;
+            state->objectCachePositionFailuresThisFrame = 0;
+            state->objectCacheLastLiveReadTick = GetTickCount64();
+            for (ObjectCacheEntry& entry : state->objectCache)
+            {
+                if (RefreshObjectCacheEntryPosition(*state, &entry))
+                {
+                    ++state->objectCachePositionsReadThisFrame;
+                }
+                else
+                {
+                    ++state->objectCachePositionFailuresThisFrame;
+                }
+            }
+        }
+
         bool ReadMatrix4x4(const ExternalMemoryReader& reader, const std::string& addressText, std::array<float, 16>* matrix)
         {
             if (!matrix)
@@ -1474,10 +1503,11 @@ namespace Aegis::UnityExternal
             state->espEntities.clear();
             if (state->entitySource == 1)
             {
+                RefreshObjectCacheLivePositions(state);
                 state->espEntities.reserve(state->objectCache.size());
                 for (ObjectCacheEntry& cached : state->objectCache)
                 {
-                    if (!RefreshObjectCacheEntryPosition(*state, &cached))
+                    if (!cached.hasPosition)
                     {
                         continue;
                     }
@@ -2279,6 +2309,9 @@ namespace Aegis::UnityExternal
                 return;
             }
 
+            state->objectCacheLastFullScanTick = GetTickCount64();
+            state->objectCachePositionsReadThisFrame = 0;
+            state->objectCachePositionFailuresThisFrame = 0;
             state->objectCache.clear();
             state->objectCacheStatus.clear();
             state->viewProjectionAutoStatus.clear();
@@ -2805,12 +2838,35 @@ namespace Aegis::UnityExternal
             lastClickThrough = state.clickThroughOverlay;
         }
 
+        void MaybeAutoRebuildObjectCache(GuiState* state)
+        {
+            if (!state || !state->objectCacheAutoRebuild || state->entitySource != 1 ||
+                !state->process || !state->reader.IsOpen())
+            {
+                return;
+            }
+
+            const ULONGLONG now = GetTickCount64();
+            const ULONGLONG interval = static_cast<ULONGLONG>(
+                std::clamp(state->objectCacheAutoRebuildMs, 5000, 300000));
+            if (state->objectCacheLastFullScanTick != 0 &&
+                now - state->objectCacheLastFullScanTick < interval)
+            {
+                return;
+            }
+
+            AddLog(state, "Auto rebuilding object cache after %llu ms.", interval);
+            RefreshObjectCache(state);
+        }
+
         void DrawExternalEspOverlay(GuiState* state)
         {
             if (!state || (!state->espEnabled && !state->radarEnabled))
             {
                 return;
             }
+
+            MaybeAutoRebuildObjectCache(state);
 
             const ImVec2 screenSize = ImGui::GetIO().DisplaySize;
             std::array<float, 16> matrix = {};
@@ -2826,6 +2882,7 @@ namespace Aegis::UnityExternal
             {
                 if (state->entitySource == 1 && !state->objectCache.empty())
                 {
+                    RefreshObjectCacheLivePositions(state);
                     ImDrawList* drawList = ImGui::GetForegroundDrawList();
                     const ImU32 noticeColor = IM_COL32(255, 206, 92, 235);
                     const ImU32 lineColor = IM_COL32(255, 206, 92, 160);
@@ -4122,7 +4179,7 @@ namespace Aegis::UnityExternal
             ImGui::SameLine();
             ImGui::Checkbox("Click Through", &state->clickThroughOverlay);
 
-            ImGui::Checkbox("ESP Boxes", &state->espEnabled);
+            ImGui::Checkbox("Draw Visuals", &state->espEnabled);
             ImGui::SameLine();
             ImGui::Checkbox("Boxes", &state->espBoxes);
             ImGui::SameLine();
@@ -4134,7 +4191,7 @@ namespace Aegis::UnityExternal
             ImGui::Combo("Entity Source", &state->entitySource, entitySources, IM_ARRAYSIZE(entitySources));
             if (state->entitySource == 1)
             {
-                ImGui::TextWrapped("Object cache source draws cached Mono or IL2CPP objects with readable positions. Configure and refresh the cache in Developer.");
+                ImGui::TextWrapped("Object cache source re-reads cached object positions every rendered frame. Full cache rebuilds for newly spawned/despawned objects are configured in Developer.");
             }
 
             ImGui::InputTextWithHint("Entity List", "pointer array or first entity address", state->entityListAddress, sizeof(state->entityListAddress));
@@ -4187,7 +4244,16 @@ namespace Aegis::UnityExternal
             ImGui::SliderFloat("Radar X", &state->radarPosX, 0.0f, 1200.0f, "%.0f");
             ImGui::SameLine();
             ImGui::SliderFloat("Radar Y", &state->radarPosY, 0.0f, 900.0f, "%.0f");
-            ImGui::Text("Entities read this frame: %zu", state->espEntities.size());
+            ImGui::Text(
+                "Entities read this frame: %zu",
+                state->espEntities.size());
+            if (state->entitySource == 1)
+            {
+                ImGui::Text(
+                    "Live cache positions: %zu ok / %zu failed",
+                    state->objectCachePositionsReadThisFrame,
+                    state->objectCachePositionFailuresThisFrame);
+            }
 
             ImGui::Separator();
             DrawDisabledFeatureMirror();
@@ -4548,12 +4614,19 @@ namespace Aegis::UnityExternal
             ImGui::Checkbox("Require Readable m_CachedPtr", &state->objectCacheRequireCachedPtr);
             ImGui::Checkbox("Auto Resolve Mono VTables", &state->objectCacheAutoResolveMono);
             ImGui::Checkbox("Auto Resolve IL2CPP Class Pointers", &state->objectCacheAutoResolveIl2Cpp);
+            ImGui::Checkbox("Auto Rebuild Cache", &state->objectCacheAutoRebuild);
+            ImGui::SameLine();
+            ImGui::InputInt("Rebuild Interval MS", &state->objectCacheAutoRebuildMs);
             ImGui::InputInt("MonoClass name offset", &state->monoClassNameOffset);
             ImGui::InputInt("MonoClass namespace offset", &state->monoClassNamespaceOffset);
             ImGui::InputInt("MonoVTable class offset", &state->monoVTableClassOffset);
             ImGui::InputInt("Il2CppClass name offset", &state->il2cppClassNameOffset);
             ImGui::InputInt("Il2CppClass namespace offset", &state->il2cppClassNamespaceOffset);
             ImGui::InputInt("Max Results##ObjectCacheMax", &state->objectCacheMaxResults);
+            if (state->objectCacheAutoRebuild && state->objectCacheAutoRebuildMs < 5000)
+            {
+                ImGui::TextDisabled("Auto rebuild is clamped to at least 5000 ms because full memory scans are expensive.");
+            }
             if (ImGui::Button("Refresh Object Cache"))
             {
                 RefreshObjectCache(state);
@@ -4571,6 +4644,10 @@ namespace Aegis::UnityExternal
             {
                 ImGui::TextWrapped("%s", state->objectCacheStatus.c_str());
             }
+            ImGui::Text(
+                "Live position reads: %zu ok / %zu failed",
+                state->objectCachePositionsReadThisFrame,
+                state->objectCachePositionFailuresThisFrame);
             if (ImGui::BeginTable("##ObjectCacheTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 140)))
             {
                 ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 140.0f);

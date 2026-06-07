@@ -249,7 +249,9 @@ For IL2CPP, provide an `Il2CppClass*` or object-header class pointer when you al
 
 For Mono, the external can also attempt read-only `MonoClass`/`MonoVTable` discovery by class name. This lets common UnityEngine components such as `UnityEngine.Rigidbody` populate the cache without manually pasting a vtable pointer. The default `MonoClass` name/namespace offsets are `0x30` and `0x38`, and the default `MonoVTable` class pointer offset is `0x0`; these are configurable in Developer for layout differences.
 
-Cached runtime objects can feed the Visual tab. Set `Entity Source` to `Object cache`, configure the position extraction mode/offsets, provide the view-projection matrix address or enable `Auto Find ViewProjection`, and enable ESP boxes/snaplines. The overlay re-reads cached object positions every frame before world-to-screen, so boxes can move with the objects once the offsets are correct.
+Cached runtime objects can feed the Visual tab. Set `Entity Source` to `Object cache`, configure the position extraction mode/offsets, provide the view-projection matrix address or enable `Auto Find ViewProjection`, and enable `Draw Visuals` with boxes/snaplines. The overlay re-reads cached object positions every rendered frame before world-to-screen, so boxes and snaplines can move with the objects once the offsets are correct.
+
+Full object-cache discovery is separate from live movement updates. A full scan walks target process memory to find matching Mono/IL2CPP object candidates, so it can be expensive on large games. Use `Refresh Object Cache` when changing component names or offsets. Enable `Auto Rebuild Cache` only when you need periodic spawn/despawn discovery; the interval is clamped to avoid accidentally running heavyweight scans every frame.
 
 If object cache entries exist but no view-projection matrix is configured, the overlay draws clearly labeled debug snaplines. Those lines only prove that the cache is active; real boxes/snaplines at the object's game position still require a valid matrix plus correct position extraction mode/offsets.
 
@@ -328,9 +330,10 @@ For a game you own or are authorized to inspect:
 8. For runtime object-cache ESP, start with the default `UnityEngine.Rigidbody` test component or enter your own component name such as `PlayerController`.
 9. On Mono, provide the matching object/vtable pointer(s). On IL2CPP, leave `Auto Resolve IL2CPP Class Pointers` enabled or provide the matching `Il2CppClass*`/header pointer(s) manually.
 10. Refresh the cache, then click `Draw Cache In Visual`.
-11. In Visual, set `Entity Source` to `Object cache`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen. If there are fewer than five unique objects, leave `Few-Sample Matrix Guess` enabled to let the external try the lower-confidence matrix scan.
-12. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, Mono object/vtable pointer, IL2CPP class pointer, or native position offsets.
-13. Use manual external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
+11. In Visual, set `Entity Source` to `Object cache`, enable `Draw Visuals`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen. If there are fewer than five unique objects, leave `Few-Sample Matrix Guess` enabled to let the external try the lower-confidence matrix scan.
+12. Watch `Live cache positions` in Visual or `Live position reads` in Developer. Those counters should update every frame while boxes/snaplines/radar are active; use `Auto Rebuild Cache` only for periodic full rediscovery of spawned/despawned objects.
+13. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, Mono object/vtable pointer, IL2CPP class pointer, or native position offsets.
+14. Use manual external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
 
 For best results, start with a small Unity test scene that has a known `UnityEngine.Rigidbody` or `PlayerController`, one camera, and a few spawned test objects. Confirm the internal cache sees the component, then move to the external prototype once you know which memory structures you want to read.
 
