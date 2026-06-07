@@ -257,6 +257,8 @@ After discovery, the external can build `Fast tracked positions`. This promotes 
 
 When `Entity Source` is `Fast tracked positions`, rendering reads those pinned Vec3 addresses first. If a direct read fails or the object header no longer matches the discovered Mono/IL2CPP pointer, the external can fall back to object-cache probing for that target. If an object is destroyed and replaced with a new object, use `Auto Rebuild Cache` or manually refresh discovery so the fast target list can be rebuilt from current objects.
 
+To make movement easier to inspect, fast targets also keep a short last-good-position grace window. `Smooth Fast Targets` holds the most recent valid Vec3 for a few hundred milliseconds when a single read misses, and `Fast Fallback Probe MS` throttles heavier object-cache fallback probes so one stale target cannot stall the overlay every frame. The Visual and Developer counters show direct/fallback reads, held positions, and failed targets separately.
+
 If object cache entries exist but no view-projection matrix is configured, the overlay draws clearly labeled debug snaplines. Those lines only prove that the cache is active; real boxes/snaplines at the object's game position still require a valid matrix plus correct position extraction mode/offsets.
 
 The `Auto probe object/native Vec3` position mode is a read-only helper for early testing. It starts from the managed object's `m_CachedPtr`, rejects nearby metadata-looking pointers, and prioritizes one-hop Transform-like native pointers before accepting plausible `Vector3` values. This is useful for confirming the cache can drive overlay lines, but a game-specific Transform/position offset is still the most reliable setup for exact world placement.

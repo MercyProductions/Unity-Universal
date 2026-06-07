@@ -138,10 +138,14 @@ namespace Aegis::UnityExternal
             std::int64_t cachedPtrToPositionOffset = 0;
             std::size_t positionShareCount = 1;
             Vec3 position;
+            Vec3 lastGoodPosition;
             bool hasPosition = false;
+            bool hasLastGoodPosition = false;
             bool likelyPlayer = false;
             int score = 0;
             int staleReads = 0;
+            ULONGLONG lastGoodReadTick = 0;
+            ULONGLONG lastFallbackProbeTick = 0;
             std::string label;
             std::string source;
             std::string offsetSummary;
@@ -180,7 +184,7 @@ namespace Aegis::UnityExternal
             char scanPattern[260] = "";
             int scanModule = 0;
             char methodFilter[160] = "";
-            char objectCacheComponentName[160] = "UnityEngine.Rigidbody";
+            char objectCacheComponentName[160] = "PlayerController";
             char objectCacheFallbackComponentName[160] = "UnityEngine.Rigidbody";
             char objectCachePointer[80] = "";
             char objectCacheFallbackPointer[80] = "";
@@ -197,7 +201,10 @@ namespace Aegis::UnityExternal
             int entitySource = 0;
             bool autoBuildFastTargets = true;
             bool fastTargetsFallbackToCache = true;
+            bool fastTargetsUseLastGood = true;
             int maxFastTargets = 64;
+            int fastTargetLastGoodMs = 350;
+            int fastTargetFallbackProbeMs = 250;
             int objectPositionMode = 5;
             int objectPointerOffset = 0;
             int objectCachedPtrOffset = 0x10;
@@ -249,6 +256,7 @@ namespace Aegis::UnityExternal
             std::size_t objectCachePositionFailuresThisFrame = 0;
             std::size_t fastTargetsReadThisFrame = 0;
             std::size_t fastTargetsFallbacksThisFrame = 0;
+            std::size_t fastTargetsHeldThisFrame = 0;
             std::size_t fastTargetsFailedThisFrame = 0;
             ULONGLONG objectCacheLastLiveReadTick = 0;
             ULONGLONG objectCacheLastFullScanTick = 0;
@@ -2399,6 +2407,7 @@ namespace Aegis::UnityExternal
             state->fastTargets.clear();
             state->fastTargetsReadThisFrame = 0;
             state->fastTargetsFallbacksThisFrame = 0;
+            state->fastTargetsHeldThisFrame = 0;
             state->fastTargetsFailedThisFrame = 0;
             state->objectCacheStatus.clear();
             state->viewProjectionAutoStatus.clear();
@@ -2874,7 +2883,10 @@ namespace Aegis::UnityExternal
                 target.matchedPointer = entry.matchedPointer;
                 target.positionAddress = entry.positionAddress;
                 target.position = entry.position;
+                target.lastGoodPosition = entry.position;
                 target.hasPosition = true;
+                target.hasLastGoodPosition = true;
+                target.lastGoodReadTick = GetTickCount64();
                 target.positionShareCount = std::max<std::size_t>(positionShareCount(entry.positionAddress), 1);
                 target.label = entry.label;
                 target.source = "fast target from " + entry.source;
@@ -2907,6 +2919,12 @@ namespace Aegis::UnityExternal
             target->positionAddress = entry.positionAddress;
             target->position = entry.position;
             target->hasPosition = entry.hasPosition;
+            if (entry.hasPosition)
+            {
+                target->lastGoodPosition = entry.position;
+                target->hasLastGoodPosition = true;
+                target->lastGoodReadTick = GetTickCount64();
+            }
             target->positionShareCount = 1;
             target->label = entry.label;
             target->source = "fast target from " + entry.source;
@@ -2919,14 +2937,41 @@ namespace Aegis::UnityExternal
         {
             Direct,
             Fallback,
+            Held,
             Failed
         };
 
         FastTargetReadResult RefreshFastTargetPosition(GuiState* state, FastTrackedTarget* target)
         {
-            if (!state || !target || target->positionAddress == 0)
+            if (!state || !target)
             {
                 return FastTargetReadResult::Failed;
+            }
+
+            const ULONGLONG now = GetTickCount64();
+            const ULONGLONG holdMs = static_cast<ULONGLONG>(
+                std::clamp(state->fastTargetLastGoodMs, 0, 5000));
+            const ULONGLONG fallbackProbeMs = static_cast<ULONGLONG>(
+                std::clamp(state->fastTargetFallbackProbeMs, 50, 5000));
+            const auto useLastGood = [&]() -> bool {
+                if (!state->fastTargetsUseLastGood || !target->hasLastGoodPosition || holdMs == 0)
+                {
+                    return false;
+                }
+                if (target->lastGoodReadTick == 0 || now - target->lastGoodReadTick > holdMs)
+                {
+                    return false;
+                }
+
+                target->position = target->lastGoodPosition;
+                target->hasPosition = true;
+                return true;
+            };
+
+            if (target->positionAddress == 0)
+            {
+                ++target->staleReads;
+                return useLastGood() ? FastTargetReadResult::Held : FastTargetReadResult::Failed;
             }
 
             bool objectHeaderMatches = true;
@@ -2945,12 +2990,26 @@ namespace Aegis::UnityExternal
                 target->position = position;
                 target->positionAddress = readAddress;
                 target->hasPosition = true;
+                target->lastGoodPosition = position;
+                target->hasLastGoodPosition = true;
+                target->lastGoodReadTick = now;
                 target->staleReads = 0;
                 return FastTargetReadResult::Direct;
             }
 
-            if (state->fastTargetsFallbackToCache && target->objectAddress != 0)
+            ++target->staleReads;
+            const bool shouldProbeFallback =
+                objectHeaderMatches &&
+                state->fastTargetsFallbackToCache &&
+                target->objectAddress != 0 &&
+                (target->lastFallbackProbeTick == 0 ||
+                    target->staleReads == 1 ||
+                    now - target->lastFallbackProbeTick >= fallbackProbeMs ||
+                    !target->hasLastGoodPosition);
+
+            if (shouldProbeFallback)
             {
+                target->lastFallbackProbeTick = now;
                 ObjectCacheEntry fallback;
                 fallback.address = target->objectAddress;
                 fallback.matchedPointer = target->matchedPointer;
@@ -2963,8 +3022,12 @@ namespace Aegis::UnityExternal
                 }
             }
 
+            if (useLastGood())
+            {
+                return FastTargetReadResult::Held;
+            }
+
             target->hasPosition = false;
-            ++target->staleReads;
             return FastTargetReadResult::Failed;
         }
 
@@ -2977,6 +3040,7 @@ namespace Aegis::UnityExternal
 
             state->fastTargetsReadThisFrame = 0;
             state->fastTargetsFallbacksThisFrame = 0;
+            state->fastTargetsHeldThisFrame = 0;
             state->fastTargetsFailedThisFrame = 0;
             for (FastTrackedTarget& target : state->fastTargets)
             {
@@ -2988,6 +3052,9 @@ namespace Aegis::UnityExternal
                 case FastTargetReadResult::Fallback:
                     ++state->fastTargetsReadThisFrame;
                     ++state->fastTargetsFallbacksThisFrame;
+                    break;
+                case FastTargetReadResult::Held:
+                    ++state->fastTargetsHeldThisFrame;
                     break;
                 case FastTargetReadResult::Failed:
                     ++state->fastTargetsFailedThisFrame;
@@ -3253,6 +3320,16 @@ namespace Aegis::UnityExternal
             const int height = client.bottom - client.top;
             if (width > 0 && height > 0)
             {
+                RECT current = {};
+                if (GetWindowRect(gWindow, &current) &&
+                    current.left == topLeft.x &&
+                    current.top == topLeft.y &&
+                    (current.right - current.left) == width &&
+                    (current.bottom - current.top) == height)
+                {
+                    return;
+                }
+
                 SetWindowPos(gWindow, HWND_TOPMOST, topLeft.x, topLeft.y, width, height, SWP_NOACTIVATE);
             }
         }
@@ -3754,6 +3831,7 @@ namespace Aegis::UnityExternal
             state->objectCachePositionFailuresThisFrame = 0;
             state->fastTargetsReadThisFrame = 0;
             state->fastTargetsFallbacksThisFrame = 0;
+            state->fastTargetsHeldThisFrame = 0;
             state->fastTargetsFailedThisFrame = 0;
             state->resolver.emplace(state->process->modules);
             if (state->methodMap)
@@ -4760,8 +4838,9 @@ namespace Aegis::UnityExternal
             else if (state->entitySource == 2)
             {
                 ImGui::Text(
-                    "Fast targets: %zu direct/fallback ok / %zu fallback / %zu failed",
+                    "Fast targets: %zu direct/fallback ok / %zu held / %zu fallback / %zu failed",
                     state->fastTargetsReadThisFrame,
+                    state->fastTargetsHeldThisFrame,
                     state->fastTargetsFallbacksThisFrame,
                     state->fastTargetsFailedThisFrame);
             }
@@ -5131,6 +5210,9 @@ namespace Aegis::UnityExternal
             ImGui::Checkbox("Auto Build Fast Targets", &state->autoBuildFastTargets);
             ImGui::SameLine();
             ImGui::Checkbox("Fast Targets Cache Fallback", &state->fastTargetsFallbackToCache);
+            ImGui::Checkbox("Smooth Fast Targets", &state->fastTargetsUseLastGood);
+            ImGui::InputInt("Fast Hold Last Good MS", &state->fastTargetLastGoodMs);
+            ImGui::InputInt("Fast Fallback Probe MS", &state->fastTargetFallbackProbeMs);
             ImGui::InputInt("Max Fast Targets", &state->maxFastTargets);
             ImGui::InputInt("MonoClass name offset", &state->monoClassNameOffset);
             ImGui::InputInt("MonoClass namespace offset", &state->monoClassNamespaceOffset);
@@ -5180,8 +5262,9 @@ namespace Aegis::UnityExternal
                 state->objectCachePositionsReadThisFrame,
                 state->objectCachePositionFailuresThisFrame);
             ImGui::Text(
-                "Fast target reads: %zu ok / %zu fallback / %zu failed",
+                "Fast target reads: %zu ok / %zu held / %zu fallback / %zu failed",
                 state->fastTargetsReadThisFrame,
+                state->fastTargetsHeldThisFrame,
                 state->fastTargetsFallbacksThisFrame,
                 state->fastTargetsFailedThisFrame);
             if (ImGui::BeginTable("##FastTargetTable", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 130)))
