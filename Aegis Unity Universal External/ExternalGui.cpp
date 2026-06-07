@@ -159,7 +159,7 @@ namespace Aegis::UnityExternal
             char scanPattern[260] = "";
             int scanModule = 0;
             char methodFilter[160] = "";
-            char objectCacheComponentName[160] = "PlayerController";
+            char objectCacheComponentName[160] = "UnityEngine.Rigidbody";
             char objectCacheFallbackComponentName[160] = "UnityEngine.Rigidbody";
             char objectCachePointer[80] = "";
             char objectCacheFallbackPointer[80] = "";
@@ -1924,22 +1924,59 @@ namespace Aegis::UnityExternal
             const std::string& componentName,
             std::string* detail)
         {
-            std::vector<int> nameOffsets;
-            AddUniqueInt(&nameOffsets, state.il2cppClassNameOffset);
-            AddUniqueInt(&nameOffsets, 0x10);
+            std::vector<int> preferredNameOffsets;
+            AddUniqueInt(&preferredNameOffsets, state.il2cppClassNameOffset);
+            AddUniqueInt(&preferredNameOffsets, 0x10);
 
-            std::vector<int> namespaceOffsets;
-            AddUniqueInt(&namespaceOffsets, state.il2cppClassNamespaceOffset);
-            AddUniqueInt(&namespaceOffsets, 0x18);
+            std::vector<int> preferredNamespaceOffsets;
+            AddUniqueInt(&preferredNamespaceOffsets, state.il2cppClassNamespaceOffset);
+            AddUniqueInt(&preferredNamespaceOffsets, 0x18);
 
-            return ResolveClassPointersByName(
+            std::string preferredDetail;
+            std::vector<uintptr_t> classPointers = ResolveClassPointersByName(
+                state,
+                componentName,
+                preferredNameOffsets,
+                preferredNamespaceOffsets,
+                "Il2CppClass",
+                32,
+                &preferredDetail);
+
+            if (!classPointers.empty())
+            {
+                if (detail)
+                {
+                    *detail = preferredDetail + " using preferred offsets";
+                }
+                return classPointers;
+            }
+
+            std::vector<int> nameOffsets = preferredNameOffsets;
+            for (int offset : { 0x18, 0x20, 0x28, 0x30, 0x38, 0x40 })
+            {
+                AddUniqueInt(&nameOffsets, offset);
+            }
+
+            std::vector<int> namespaceOffsets = preferredNamespaceOffsets;
+            for (int offset : { 0x20, 0x28, 0x30, 0x38, 0x40, 0x48 })
+            {
+                AddUniqueInt(&namespaceOffsets, offset);
+            }
+
+            std::string fallbackDetail;
+            classPointers = ResolveClassPointersByName(
                 state,
                 componentName,
                 nameOffsets,
                 namespaceOffsets,
                 "Il2CppClass",
                 32,
-                detail);
+                &fallbackDetail);
+            if (detail)
+            {
+                *detail = fallbackDetail + " using fallback offsets; preferred offsets: " + preferredDetail;
+            }
+            return classPointers;
         }
 
         void AddIl2CppAutoClassTargets(GuiState* state, std::vector<ObjectCacheTarget>* targets, const std::string& componentName)
@@ -2140,7 +2177,7 @@ namespace Aegis::UnityExternal
 
             const RuntimeBackend backend = state->process->modules.Backend();
             const std::string backendName = WideToUtf8(RuntimeBackendName(backend));
-            const std::string primaryLabel = TrimAscii(state->objectCacheComponentName[0] ? state->objectCacheComponentName : "PlayerController");
+            const std::string primaryLabel = TrimAscii(state->objectCacheComponentName[0] ? state->objectCacheComponentName : "UnityEngine.Rigidbody");
             const std::string fallbackLabel = TrimAscii(state->objectCacheFallbackComponentName[0] ? state->objectCacheFallbackComponentName : "UnityEngine.Rigidbody");
 
             std::vector<ObjectCacheTarget> targets;
@@ -2191,7 +2228,7 @@ namespace Aegis::UnityExternal
                 state->objectCacheStatus =
                     backend == RuntimeBackend::IL2CPP
                     ? "No IL2CPP class pointer found. Paste an Il2CppClass/header pointer or adjust class offsets."
-                    : "Type a PlayerController or Rigidbody object/vtable pointer first.";
+                    : "Type a Rigidbody object/vtable pointer first.";
                 AddLog(state, "Object cache scan skipped: no component class/header pointer.");
                 return;
             }
@@ -4376,7 +4413,7 @@ namespace Aegis::UnityExternal
 
             ImGui::Text("Runtime Object Cache");
             ImGui::TextWrapped("Mono scans for object/vtable pointers and can try to discover MonoVTables by readable class-name metadata. IL2CPP scans for Il2CppClass/header pointers.");
-            ImGui::InputTextWithHint("Primary Component##ObjectCacheComponent", "PlayerController", state->objectCacheComponentName, sizeof(state->objectCacheComponentName));
+            ImGui::InputTextWithHint("Primary Component##ObjectCacheComponent", "UnityEngine.Rigidbody", state->objectCacheComponentName, sizeof(state->objectCacheComponentName));
             ImGui::InputTextWithHint("Primary VTable/Class Pointer##ObjectCachePointer", "0x00000000", state->objectCachePointer, sizeof(state->objectCachePointer));
             ImGui::InputTextWithHint("Fallback Component##ObjectCacheFallbackComponent", "UnityEngine.Rigidbody", state->objectCacheFallbackComponentName, sizeof(state->objectCacheFallbackComponentName));
             ImGui::InputTextWithHint("Fallback VTable/Class Pointer##ObjectCacheFallbackPointer", "0x00000000", state->objectCacheFallbackPointer, sizeof(state->objectCacheFallbackPointer));

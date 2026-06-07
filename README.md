@@ -199,7 +199,7 @@ global-metadata.dat
 GameAssembly.dll
 ```
 
-The automatic IL2CPP generator currently targets common fixed-width metadata layouts such as metadata v24-v31. It locates codegen modules by image name inside `GameAssembly.dll`, reads each module method pointer table, and builds an in-memory method map. This has been useful for standard Unity IL2CPP builds, but it is still a prototype and may not work on every Unity version or custom build pipeline.
+The automatic IL2CPP generator currently targets common fixed-width metadata layouts such as metadata v24-v31, including 84-, 88-, and 92-byte type definition rows seen across Unity variants. It locates codegen modules by image name inside `GameAssembly.dll`, reads each module method pointer table, and builds an in-memory method map. This has been useful for standard Unity IL2CPP builds, but it is still a prototype and may not work on every Unity version or custom build pipeline.
 
 When a method map is available, the external startup resolves the same common Unity method presets the internal bootstrap cares about, including:
 
@@ -241,11 +241,11 @@ Mono method resolution therefore returns a metadata identity, such as `UnityEngi
 
 ## External Runtime Object Cache
 
-The Developer tab includes a read-only runtime object cache scanner for both Mono and IL2CPP. Enter a primary component name such as `PlayerController` and an optional fallback such as `UnityEngine.Rigidbody`, then refresh the cache. The scanner walks committed readable private/mapped memory with `VirtualQueryEx` and caches addresses whose first pointer-sized field matches a target runtime header pointer.
+The Developer tab includes a read-only runtime object cache scanner for both Mono and IL2CPP. The current testing default is `UnityEngine.Rigidbody` for both the primary and fallback component fields; you can replace either field with your own component such as `PlayerController`, then refresh the cache. The scanner walks committed readable private/mapped memory with `VirtualQueryEx` and caches addresses whose first pointer-sized field matches a target runtime header pointer.
 
 For Mono, provide the Mono object/vtable pointer for the component when you know it from your own diagnostics, symbols, logs, or internal testing.
 
-For IL2CPP, provide an `Il2CppClass*` or object-header class pointer when you already know it. The external can also attempt a read-only class-name scan: it searches readable process memory for class-name strings, finds candidate `Il2CppClass::name` references, validates the namespace when a fully qualified name is used, and then scans for live objects whose first pointer matches the candidate class pointer. The default x64 `Il2CppClass::name` and `Il2CppClass::namespaze` offsets are `0x10` and `0x18`; both are configurable in the Developer tab for Unity-version/layout differences.
+For IL2CPP, provide an `Il2CppClass*` or object-header class pointer when you already know it. The external can also attempt a read-only class-name scan: it searches readable process memory for class-name strings, finds candidate `Il2CppClass::name` references, validates the namespace when a fully qualified name is used, and then scans for live objects whose first pointer matches the candidate class pointer. The default x64 `Il2CppClass::name` and `Il2CppClass::namespaze` offsets are `0x10` and `0x18`; both are configurable in the Developer tab for Unity-version/layout differences, and the scanner tries nearby pointer-aligned fallbacks automatically if the preferred offsets do not resolve.
 
 For Mono, the external can also attempt read-only `MonoClass`/`MonoVTable` discovery by class name. This lets common UnityEngine components such as `UnityEngine.Rigidbody` populate the cache without manually pasting a vtable pointer. The default `MonoClass` name/namespace offsets are `0x30` and `0x38`, and the default `MonoVTable` class pointer offset is `0x0`; these are configurable in Developer for layout differences.
 
@@ -325,14 +325,14 @@ For a game you own or are authorized to inspect:
 5. Start the game, then launch the external executable and type the process exe name.
 6. Confirm the console reports the expected runtime, module addresses, and method-map status.
 7. Use the external Developer and Universal tabs to inspect exports, method maps, process modules, AOB scans, object-cache candidates, and read-only memory values.
-8. For runtime object-cache ESP, enter `PlayerController` as the primary component and `UnityEngine.Rigidbody` as the fallback.
+8. For runtime object-cache ESP, start with the default `UnityEngine.Rigidbody` test component or enter your own component name such as `PlayerController`.
 9. On Mono, provide the matching object/vtable pointer(s). On IL2CPP, leave `Auto Resolve IL2CPP Class Pointers` enabled or provide the matching `Il2CppClass*`/header pointer(s) manually.
 10. Refresh the cache, then click `Draw Cache In Visual`.
 11. In Visual, set `Entity Source` to `Object cache`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen.
 12. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, Mono object/vtable pointer, IL2CPP class pointer, or native position offsets.
 13. Use manual external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
 
-For best results, start with a small Unity test scene that has a known `PlayerController`, one camera, and a few spawned test objects. Confirm the internal cache sees the component, then move to the external prototype once you know which memory structures you want to read.
+For best results, start with a small Unity test scene that has a known `UnityEngine.Rigidbody` or `PlayerController`, one camera, and a few spawned test objects. Confirm the internal cache sees the component, then move to the external prototype once you know which memory structures you want to read.
 
 ## Current External Prototype Limits
 

@@ -359,7 +359,13 @@ namespace Aegis::UnityExternal
                 return false;
             }
 
-            if (layout->typeDefinitions.size % 88 == 0)
+            if (layout->typeDefinitions.size % 92 == 0)
+            {
+                layout->typeDefinitionStride = 92;
+                layout->typeMethodStartOffset = 40;
+                layout->typeMethodCountOffset = 68;
+            }
+            else if (layout->typeDefinitions.size % 88 == 0)
             {
                 layout->typeDefinitionStride = 88;
                 layout->typeMethodStartOffset = 36;
@@ -375,7 +381,8 @@ namespace Aegis::UnityExternal
             {
                 if (error)
                 {
-                    *error = "Unsupported IL2CPP type definition row size.";
+                    *error = "Unsupported IL2CPP type definition row size: " +
+                        std::to_string(layout->typeDefinitions.size) + " bytes.";
                 }
                 return false;
             }
