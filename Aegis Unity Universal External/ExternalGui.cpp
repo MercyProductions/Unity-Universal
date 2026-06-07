@@ -133,8 +133,10 @@ namespace Aegis::UnityExternal
             uintptr_t address = 0;
             int layout = 0;
             int score = 0;
+            int structuralScore = 0;
             int validPoints = 0;
             int onScreenPoints = 0;
+            int goodHeightPoints = 0;
             std::array<float, 16> matrix{};
         };
 
@@ -195,6 +197,7 @@ namespace Aegis::UnityExternal
             int positionOffset = 0;
             char viewProjectionAddress[80] = "";
             bool autoResolveViewProjection = true;
+            bool allowFewSampleViewProjectionGuess = true;
             int viewProjectionScanMaxMs = 2500;
             int matrixLayout = 0;
             int upAxis = 0;
@@ -1038,6 +1041,98 @@ namespace Aegis::UnityExternal
             return samples;
         }
 
+        float Vec3Dot(const Vec3& left, const Vec3& right)
+        {
+            return left.x * right.x + left.y * right.y + left.z * right.z;
+        }
+
+        float Vec3Length(const Vec3& value)
+        {
+            return std::sqrt(Vec3Dot(value, value));
+        }
+
+        int ViewProjectionStructureScore(const std::array<float, 16>& matrix, int layout)
+        {
+            Vec3 xVector{};
+            Vec3 yVector{};
+            Vec3 wVector{};
+            if (layout == 0)
+            {
+                xVector = { matrix[0], matrix[1], matrix[2] };
+                yVector = { matrix[4], matrix[5], matrix[6] };
+                wVector = { matrix[12], matrix[13], matrix[14] };
+            }
+            else
+            {
+                xVector = { matrix[0], matrix[4], matrix[8] };
+                yVector = { matrix[1], matrix[5], matrix[9] };
+                wVector = { matrix[3], matrix[7], matrix[11] };
+            }
+
+            const float xLength = Vec3Length(xVector);
+            const float yLength = Vec3Length(yVector);
+            const float wLength = Vec3Length(wVector);
+            if (!std::isfinite(xLength) || !std::isfinite(yLength) || !std::isfinite(wLength))
+            {
+                return -40;
+            }
+
+            int score = 0;
+            if (wLength >= 0.0001f && wLength <= 10000.0f)
+            {
+                score += 18;
+            }
+            else
+            {
+                score -= 32;
+            }
+
+            if (xLength >= 0.0001f && xLength <= 10000.0f)
+            {
+                score += 8;
+            }
+            if (yLength >= 0.0001f && yLength <= 10000.0f)
+            {
+                score += 8;
+            }
+            if (xLength > 0.0001f && yLength > 0.0001f)
+            {
+                const float ratio = xLength > yLength ? xLength / yLength : yLength / xLength;
+                if (ratio <= 100.0f)
+                {
+                    score += 8;
+                }
+
+                const float xyDot = std::abs(Vec3Dot(xVector, yVector) / (xLength * yLength));
+                if (std::isfinite(xyDot) && xyDot < 0.995f)
+                {
+                    score += 6;
+                }
+            }
+
+            if (wLength > 0.0001f)
+            {
+                if (xLength > 0.0001f)
+                {
+                    const float xwDot = std::abs(Vec3Dot(xVector, wVector) / (xLength * wLength));
+                    if (std::isfinite(xwDot) && xwDot < 0.9995f)
+                    {
+                        score += 3;
+                    }
+                }
+                if (yLength > 0.0001f)
+                {
+                    const float ywDot = std::abs(Vec3Dot(yVector, wVector) / (yLength * wLength));
+                    if (std::isfinite(ywDot) && ywDot < 0.9995f)
+                    {
+                        score += 3;
+                    }
+                }
+            }
+
+            return score;
+        }
+
         MatrixCandidate ScoreViewProjectionMatrix(
             uintptr_t address,
             const std::array<float, 16>& matrix,
@@ -1051,6 +1146,8 @@ namespace Aegis::UnityExternal
             candidate.address = address;
             candidate.layout = layout;
             candidate.matrix = matrix;
+            candidate.structuralScore = ViewProjectionStructureScore(matrix, layout);
+            candidate.score += candidate.structuralScore;
 
             if (samples.empty() || screenSize.x <= 1.0f || screenSize.y <= 1.0f)
             {
@@ -1093,6 +1190,7 @@ namespace Aegis::UnityExternal
                 if (height >= 6.0f && height <= screenSize.y * 0.95f)
                 {
                     ++goodHeightCount;
+                    ++candidate.goodHeightPoints;
                 }
 
                 if (feetNear || headNear)
@@ -1201,11 +1299,12 @@ namespace Aegis::UnityExternal
                 return false;
             }
 
-            if (samples.size() < 5)
+            const bool fewSampleFallback = samples.size() < 5;
+            if (fewSampleFallback && !state->allowFewSampleViewProjectionGuess)
             {
                 std::ostringstream stream;
                 stream << "Auto matrix scan skipped: only " << samples.size()
-                    << " unique position sample(s); need at least 5 to avoid false camera matrices.";
+                    << " unique position sample(s); enable Few-Sample Matrix Guess or provide a manual matrix address.";
                 state->viewProjectionAutoStatus = stream.str();
                 AddLog(state, "%s", state->viewProjectionAutoStatus.c_str());
                 return false;
@@ -1303,19 +1402,41 @@ namespace Aegis::UnityExternal
                 address = next;
             }
 
-            if (best.score >= 44 && best.onScreenPoints > 0 && best.validPoints > 0)
+            const int requiredScore = fewSampleFallback
+                ? (samples.size() <= 2 ? 86 : 78)
+                : 44;
+            const int requiredStructureScore = fewSampleFallback ? 34 : 0;
+            const bool foundConfidentMatrix =
+                best.score >= requiredScore &&
+                best.structuralScore >= requiredStructureScore &&
+                best.onScreenPoints > 0 &&
+                best.validPoints > 0 &&
+                (!fewSampleFallback || best.goodHeightPoints > 0);
+
+            if (foundConfidentMatrix)
             {
                 CopyToBuffer(state->viewProjectionAddress, sizeof(state->viewProjectionAddress), FormatHex(best.address));
                 state->matrixLayout = best.layout;
                 std::ostringstream stream;
-                stream << "Auto matrix selected " << FormatHex(best.address)
+                stream << "Auto matrix selected ";
+                if (fewSampleFallback)
+                {
+                    stream << "few-sample guess ";
+                }
+                stream << FormatHex(best.address)
                     << " (" << (best.layout == 0 ? "row-major" : "column-major")
                     << ", score " << best.score
+                    << ", structure " << best.structuralScore
                     << ", points " << best.onScreenPoints << "/" << best.validPoints
+                    << ", height " << best.goodHeightPoints
                     << ", samples " << samples.size() << ")";
                 if (timedOut)
                 {
                     stream << " before scan budget ended";
+                }
+                if (fewSampleFallback)
+                {
+                    stream << ". Verify visually; a manual matrix address is still more reliable with only a few samples.";
                 }
                 state->viewProjectionAutoStatus = stream.str();
                 AddLog(state, "%s", state->viewProjectionAutoStatus.c_str());
@@ -1323,9 +1444,13 @@ namespace Aegis::UnityExternal
             }
 
             std::ostringstream stream;
-            stream << "Auto matrix scan found no confident matrix"
+            stream << (fewSampleFallback
+                ? "Few-sample matrix scan found no plausible matrix"
+                : "Auto matrix scan found no confident matrix")
                 << " (best score " << best.score
+                << ", structure " << best.structuralScore
                 << ", points " << best.onScreenPoints << "/" << best.validPoints
+                << ", height " << best.goodHeightPoints
                 << ", samples " << samples.size()
                 << ", regions " << scannedRegions
                 << ", plausible matrices " << scannedMatrices;
@@ -4037,6 +4162,8 @@ namespace Aegis::UnityExternal
 
             ImGui::InputTextWithHint("ViewProjection Matrix", "address of 16-float view-projection matrix", state->viewProjectionAddress, sizeof(state->viewProjectionAddress));
             ImGui::Checkbox("Auto Find ViewProjection", &state->autoResolveViewProjection);
+            ImGui::SameLine();
+            ImGui::Checkbox("Few-Sample Matrix Guess", &state->allowFewSampleViewProjectionGuess);
             ImGui::SameLine();
             if (ImGui::Button("Find ViewProjection"))
             {

@@ -255,7 +255,7 @@ If object cache entries exist but no view-projection matrix is configured, the o
 
 The `Auto probe object/native Vec3` position mode is a read-only helper for early testing. It starts from the managed object's `m_CachedPtr`, rejects nearby metadata-looking pointers, and prioritizes one-hop Transform-like native pointers before accepting plausible `Vector3` values. This is useful for confirming the cache can drive overlay lines, but a game-specific Transform/position offset is still the most reliable setup for exact world placement.
 
-`Auto Find ViewProjection` is also best-effort. It samples cached object positions, scans readable private/mapped memory for plausible 4x4 float matrices, scores row-major and column-major layouts, and fills the matrix address only when the samples are varied enough to avoid obvious false positives. If the console or GUI says there are too few unique position samples, the external is deliberately refusing to guess; use the internal tool, your own game symbols/logs, or a known camera/matrix address to finish that target-specific setup.
+`Auto Find ViewProjection` is also best-effort. It samples cached object positions, scans readable private/mapped memory for plausible 4x4 float matrices, scores row-major and column-major layouts, and prefers a strict multi-sample match when enough unique objects are visible. For small scenes, `Few-Sample Matrix Guess` allows a lower-confidence fallback with one to four unique positions by adding heavier view-projection structure checks plus projected height validation. If that fallback selects the wrong matrix, disable it and use the internal tool, your own game symbols/logs, or a known camera/matrix address to finish that target-specific setup.
 
 Object-cache position modes:
 
@@ -328,7 +328,7 @@ For a game you own or are authorized to inspect:
 8. For runtime object-cache ESP, start with the default `UnityEngine.Rigidbody` test component or enter your own component name such as `PlayerController`.
 9. On Mono, provide the matching object/vtable pointer(s). On IL2CPP, leave `Auto Resolve IL2CPP Class Pointers` enabled or provide the matching `Il2CppClass*`/header pointer(s) manually.
 10. Refresh the cache, then click `Draw Cache In Visual`.
-11. In Visual, set `Entity Source` to `Object cache`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen.
+11. In Visual, set `Entity Source` to `Object cache`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen. If there are fewer than five unique objects, leave `Few-Sample Matrix Guess` enabled to let the external try the lower-confidence matrix scan.
 12. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, Mono object/vtable pointer, IL2CPP class pointer, or native position offsets.
 13. Use manual external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
 
