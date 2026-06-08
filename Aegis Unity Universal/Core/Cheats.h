@@ -50,6 +50,16 @@ namespace AegisUniversal {
 		return directory + "\\config.ini";
 	}
 
+	std::string ExternalProfilePath()
+	{
+		char appData[MAX_PATH] = {};
+		const DWORD length = GetEnvironmentVariableA("APPDATA", appData, MAX_PATH);
+		std::string directory = length > 0 ? appData : ".";
+		directory += "\\AegisUnityUniversal";
+		CreateDirectoryA(directory.c_str(), nullptr);
+		return directory + "\\external_profile.ini";
+	}
+
 	void WriteColor(std::ofstream& out, const char* key, const ImColor& color)
 	{
 		out << key << "=" << color.Value.x << "," << color.Value.y << "," << color.Value.z << "," << color.Value.w << "\n";
@@ -1179,6 +1189,17 @@ namespace AegisUniversal {
 		return object->GetTransform();
 	}
 
+	Unity::CComponent* GetObjectComponent(Unity::CGameObject* object, const char* componentName)
+	{
+		if (!object || !componentName || !componentName[0])
+			return nullptr;
+
+		if (MonoUnity::Active())
+			return MonoUnity::GetComponentByName(object, componentName);
+
+		return object->GetComponent(componentName);
+	}
+
 	bool GetTransformPosition(Unity::CTransform* transform, Unity::Vector3& position)
 	{
 		if (!transform)
@@ -1189,6 +1210,89 @@ namespace AegisUniversal {
 
 		position = transform->GetPosition();
 		return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
+	}
+
+	bool ExportExternalProfile()
+	{
+		ClampRuntimeSettings();
+
+		std::ofstream out(ExternalProfilePath(), std::ios::trunc);
+		if (!out.is_open()) {
+			SetConfigStatus("External profile export failed");
+			return false;
+		}
+
+		out << "# Aegis Unity Universal internal-to-external read-only profile\n";
+		out << "runtime=" << RuntimeName() << "\n";
+		out << "object_cache_component=" << CheatVariables::PlayerComponentName << "\n";
+		out << "object_cache_fallback=" << CheatVariables::PlayerFallbackComponentName << "\n";
+		out << "object_cache_use_fallback=" << (CheatVariables::UsePlayerFallbackComponent ? 1 : 0) << "\n";
+		out << "object_position_mode=5\n";
+		out << "cached_ptr_offset=16\n";
+		out << "unity_object_index=1\n";
+		out << "auto_build_fast_targets=1\n";
+		out << "fast_targets_cache_fallback=1\n";
+		out << "entity_position_anchor=0\n";
+		out << "up_axis=0\n";
+		out << "entity_head_offset=" << CheatMenuVariables::FakeHeadPosDiff << "\n";
+		out << "entity_feet_offset=" << CheatMenuVariables::FakeFeetPosDiff << "\n";
+		out << "entity_height=" << (CheatMenuVariables::FakeHeadPosDiff + CheatMenuVariables::FakeFeetPosDiff) << "\n";
+		out << "test_component=" << CheatVariables::TestObjects::Name << "\n";
+		out << "players_cached=" << CheatVariables::PlayersCacheCount.load() << "\n";
+		out << "test_objects_cached=" << CheatVariables::TestObjects::CacheCount.load() << "\n";
+
+		auto writeObjectSample = [&](const char* prefix, int index, Unity::CGameObject* object, const char* componentName) {
+			if (!object)
+				return;
+
+			Unity::CComponent* component = nullptr;
+			Unity::CTransform* transform = nullptr;
+			Unity::Vector3 position = {};
+			try {
+				component = GetObjectComponent(object, componentName);
+				transform = GetObjectTransform(object);
+				if (!transform || !GetTransformPosition(transform, position))
+					return;
+			}
+			catch (...) {
+				return;
+			}
+
+			out << prefix << "_" << index << "_gameobject=0x" << std::hex << reinterpret_cast<uintptr_t>(object) << std::dec << "\n";
+			if (component)
+				out << prefix << "_" << index << "_component=0x" << std::hex << reinterpret_cast<uintptr_t>(component) << std::dec << "\n";
+			out << prefix << "_" << index << "_component_name=" << (componentName ? componentName : "") << "\n";
+			out << prefix << "_" << index << "_transform=0x" << std::hex << reinterpret_cast<uintptr_t>(transform) << std::dec << "\n";
+			out << prefix << "_" << index << "_position=" << position.x << "," << position.y << "," << position.z << "\n";
+			out << prefix << "_" << index << "_name=" << CachedObjectName(object) << "\n";
+		};
+
+		const int playerCacheSource = CheatVariables::PlayersCacheSource.load();
+		const char* playerComponentName = playerCacheSource == 2
+			? CheatVariables::PlayerFallbackComponentName
+			: CheatVariables::PlayerComponentName;
+		std::vector<Unity::CGameObject*> players;
+		{
+			std::scoped_lock lock(CheatVariables::PlayersListMutex);
+			players = CheatVariables::PlayersList;
+		}
+		const int playerSamples = static_cast<int>(std::min<std::size_t>(players.size(), 16));
+		out << "player_sample_count=" << playerSamples << "\n";
+		for (int index = 0; index < playerSamples; ++index)
+			writeObjectSample("player", index, players[static_cast<std::size_t>(index)], playerComponentName);
+
+		std::vector<Unity::CGameObject*> objects;
+		{
+			std::scoped_lock lock(CheatVariables::TestObjects::ListMutex);
+			objects = CheatVariables::TestObjects::List;
+		}
+		const int objectSamples = static_cast<int>(std::min<std::size_t>(objects.size(), 16));
+		out << "object_sample_count=" << objectSamples << "\n";
+		for (int index = 0; index < objectSamples; ++index)
+			writeObjectSample("object", index, objects[static_cast<std::size_t>(index)], CheatVariables::TestObjects::Name);
+
+		SetConfigStatus("External profile exported");
+		return true;
 	}
 
 	bool TryGetMainCameraPosition(Unity::Vector3& position)
@@ -2822,6 +2926,10 @@ void DrawMenu()
 				ImGui::Checkbox("Auto-save On Detach", &CheatMenuVariables::AutoSaveConfig);
 				if (ImGui::Button("Copy Diagnostics")) {
 					AegisUniversal::CopyDiagnosticsToClipboard();
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Export External Profile")) {
+					AegisUniversal::ExportExternalProfile();
 				}
 				ImGui::SameLine();
 				if (ImGui::Button("Clamp HUD")) {

@@ -20,7 +20,7 @@ The internal and external builds share the same goal: make Unity runtime inspect
 | Runtime export resolver | Yes | Yes |
 | IL2CPP method resolving | Yes, plus generated/internal SDK data when available | Yes, from maps/dumps or auto-generated metadata map |
 | Mono method resolving | Yes, through the internal Mono runtime helpers | Yes for metadata identity from `_Data\Managed` assemblies; no target-process invocation |
-| Object/GameObject cache | Yes | Offset-driven visuals plus a read-only Mono/IL2CPP runtime pointer candidate cache |
+| Object/GameObject cache | Yes | Offset-driven visuals plus a read-only Mono/IL2CPP runtime pointer candidate cache and internal-profile calibration bridge |
 | ESP/radar/crosshair | In-game overlay path | Offset-driven external overlay path |
 | Lua | Yes, internal process scripting surface | No |
 | Memory writes/patches | Internal features can modify in-process state | No; external memory access is read-only |
@@ -68,6 +68,7 @@ Internal runtime setup currently includes:
 - Config save/load support.
 - Visual, aim, exploit, misc, universal, and developer menu panels.
 - Developer diagnostics for runtime status, object cache status, FOV state, and config path.
+- `Export External Profile` for writing the current internal component names, visual height offsets, and live component/GameObject/Transform samples to `%APPDATA%\AegisUnityUniversal\external_profile.ini`.
 - Lua scripting surface for local experimentation.
 
 ## Changing The Internal Component Search
@@ -251,19 +252,46 @@ For Mono, the external can also attempt read-only `MonoClass`/`MonoVTable` disco
 
 When a generated metadata map is available, component name auto-resolution prioritizes the best matching script type before scanning process memory. For example, a short name such as `PlayerController` prefers `PlayerController` from `Assembly-CSharp` over unrelated package classes with the same short name, such as `Rewired.Components.PlayerController`. If there are still duplicates in your own build, use the fully qualified namespace in the component field.
 
+`Deep Metadata Fallback Labels` in Developer is optional and intentionally off by default. When enabled, the external ranks nearby player/character/controller-style `Assembly-CSharp` types from the metadata map and adds a small number of read-only fallback scan labels. This can help with unknown games, but it runs extra class-name scans and can make startup/discovery much slower.
+
 Cached runtime objects can feed the Visual tab. Set `Entity Source` to `Object cache`, configure the position extraction mode/offsets, provide the view-projection matrix address or enable `Auto Find ViewProjection`, and enable `Draw Visuals` with boxes/snaplines. The overlay re-reads cached object positions every rendered frame before world-to-screen, so boxes and snaplines can move with the objects once the offsets are correct.
+
+For parity testing against the internal DLL, use the profile bridge:
+
+1. In the internal menu, configure the player/test component and confirm the internal overlay is drawing the correct objects.
+2. Click `Export External Profile` in the internal Universal/config area.
+3. Start or focus the external tool, attach to the same target, then open Developer > Runtime Object Cache.
+4. Click `Load Internal Profile`.
+5. The external will import the profile settings and convert exported live Transform samples into read-only fast targets when those addresses are still valid.
+
+The profile file is:
+
+```text
+%APPDATA%\AegisUnityUniversal\external_profile.ini
+```
+
+This bridge does not inject, call Unity, or write memory from the external process. It simply lets the already-running internal build export the exact component/GameObject/Transform addresses it resolved through Unity so the external can test its read-only Transform hierarchy reconstruction against known-good objects.
 
 Full object-cache discovery is separate from live movement updates. A full scan walks target process memory to find matching Mono/IL2CPP object candidates, so it can be expensive on large games. Use `Refresh Object Cache` when changing component names or offsets. Enable `Auto Rebuild Cache` only when you need periodic spawn/despawn discovery; the interval is clamped to avoid accidentally running heavyweight scans every frame.
 
-After discovery, the external can build `Fast tracked positions`. This promotes cached objects with readable positions into direct Vec3 reads using the exact position address discovered during probing. The fast target table shows a likely-player heuristic, score, object address, position address, inferred offsets such as object-relative and `m_CachedPtr`-relative deltas, and whether many cached objects share the same position read. The likely-player marker is only a heuristic for debugging and identification; verify it against your own scene and component names.
+After discovery, the external can build `Fast tracked positions`. Plain offset candidates still promote to direct Vec3 reads, but Transform-backed candidates now keep their discovered Transform/native base and recompute the TransformAccess-style world position every frame. The fast target table shows a likely-player heuristic, score, object address, position address, Transform address when available, the position route, inferred offsets such as object-relative and `m_CachedPtr`-relative deltas, and whether many cached objects share the same position read. The likely-player marker is only a heuristic for debugging and identification; verify it against your own scene and component names.
 
-When `Entity Source` is `Fast tracked positions`, rendering reads those pinned Vec3 addresses first. If a direct read fails, the object header no longer matches the discovered Mono/IL2CPP pointer, or the position was found through an indirect transform probe instead of a close object/native offset, the external falls back to object-cache probing for that target. If an object is destroyed and replaced with a new object, use `Auto Rebuild Cache` or manually refresh discovery so the fast target list can be rebuilt from current objects.
+Position route matters:
+
+- `internal profile -> TransformAccess hierarchy` means the external is following a Transform exported by the internal bridge.
+- `indexed Transform` or `native GameObject -> indexed Transform` means the external found a read-only Unity Transform companion and is closest to the internal `GetObjectTransform -> GetPosition` route.
+- `object + Vec3 offset`, `m_CachedPtr -> native Vec3 offset`, or similar manual modes mean you supplied an offset route.
+- `broad Vec3 scan` means the external accepted a weak auto-probe fallback; treat it as a debugging clue, not a final player offset.
+
+Weak auto-probe Vec3 routes are shown in the Developer tables, but they do not feed overlay visuals by default. Enable `Draw Weak Auto-Probe Vec3` only when you intentionally want to visualize those guesses during offset research.
+
+When `Entity Source` is `Fast tracked positions`, rendering reads direct Vec3 targets or recomputes Transform-backed targets first. If a direct read fails, the object header no longer matches the discovered Mono/IL2CPP pointer, or the Transform recompute fails, the external falls back to object-cache probing for that target. If an object is destroyed and replaced with a new object, use `Auto Rebuild Cache` or manually refresh discovery so the fast target list can be rebuilt from current objects.
 
 To make movement easier to inspect, fast targets also keep a short last-good-position grace window. `Smooth Fast Targets` holds the most recent valid Vec3 for a few hundred milliseconds when a single read misses, and `Fast Fallback Probe MS` throttles heavier stale-target fallback probes so one failed direct address cannot stall the overlay every frame. Far indirect transform candidates are intentionally re-probed more often because the derived world position may not live at one stable close offset. The Visual and Developer counters show direct/fallback reads, held positions, and failed targets separately.
 
 If object cache entries exist but no view-projection matrix is configured, the overlay draws clearly labeled debug snaplines. Those lines only prove that the cache is active; real boxes/snaplines at the object's game position still require a valid matrix plus correct position extraction mode/offsets.
 
-The `Auto probe object/native Vec3` position mode is a read-only helper for early testing. It starts from the managed object's `m_CachedPtr`, rejects nearby metadata-looking pointers, tries common Unity TransformAccess-style data (`Transform + 0x38/0x40`, matrix list, parent index list), and then scores one-hop Transform-like native pointers before accepting plausible `Vector3` values. This is useful for confirming the cache can drive overlay lines, but a game-specific Transform/position offset is still the most reliable setup for exact world placement.
+The `Auto probe object/native Vec3` position mode is a read-only helper for early testing. It starts from the managed object's `m_CachedPtr`, rejects nearby metadata-looking pointers, builds a companion index of readable Transform/GameObject/Camera wrappers, tries component -> GameObject -> Transform companion chains, tries common Unity TransformAccess-style data (`Transform + 0x38/0x40`, matrix list, parent index list), and then scores one-hop/two-hop Transform-like native pointers before accepting plausible `Vector3` values. Duplicate Transform/position sources are skipped during discovery so early false positives do not fill the cache before unique objects are found. Transform-backed/profile-backed routes are ranked above weak direct-Vec3 guesses because they match the internal render path more closely.
 
 The Visual tab also includes alignment controls for external boxes and snaplines. `Position Anchor = Root / Transform` treats the resolved Vec3 as the object's transform/root and applies separate head and feet offsets; `Position Anchor = Feet` preserves the older behavior where the resolved Vec3 is already the bottom of the box and `Entity Height` controls the top. The default root mode matches the internal overlay style more closely for typical player transforms.
 
@@ -284,6 +312,8 @@ The default `m_CachedPtr` offset is `0x10`, which matches the common x64 managed
 
 The default object-cache scan target is 32 results so startup and diagnostics stay responsive. Increase `Max Results` in Developer only when you need a deeper scan and are comfortable with a slower full-process pass. `Class Scan Budget MS` limits class-name/vtable discovery, and `Object Cache Scan MS` limits the full object candidate walk; raise them only when a large target needs deeper discovery.
 
+`Companion Scan Bytes` controls how far the auto-probe scans around a managed/native object looking for a readable GameObject or Transform companion pointer. The default is intentionally moderate and can be raised for a game you own when the class is found but the position route is still `n/a`.
+
 You can test object-cache discovery from the console without opening the GUI:
 
 ```powershell
@@ -299,7 +329,7 @@ Use the internal DLL when you need full runtime interaction or actual in-process
 
 The external GUI has a transparent borderless desktop window, not a game render hook. It draws its own ImGui overlay over the desktop. The game is never hooked or patched by this path.
 
-External ESP/radar is offset-driven. You must provide the game-specific data layout:
+External ESP/radar can use the runtime object cache/fast targets when discovery succeeds, or manual offsets when you already know the target layout. Manual ESP/radar needs the game-specific data layout:
 
 - Entity list address.
 - Entity count or entity count address.
@@ -309,7 +339,7 @@ External ESP/radar is offset-driven. You must provide the game-specific data lay
 - Matrix layout.
 - Optional local-player/local-position address for radar.
 
-Once those values are configured, the external overlay can draw boxes, snaplines, and radar using its own world-to-screen math. It does not yet automatically discover every GameObject or component from outside the process. For unknown games, use your own symbols, debug builds, dumps, logs, or the internal object/component tools to identify the right component and offsets first.
+Once those values are configured, the external overlay can draw boxes, snaplines, and radar using its own world-to-screen math. Manual `object + offset` style routes are preserved as real offset paths; the auto-probe false-positive guard is only applied to broad automatic guesses. The automatic cache is best-effort and does not yet discover every GameObject/component layout from outside the process. For unknown games, use your own symbols, debug builds, dumps, logs, the internal export profile, or the internal object/component tools to identify the right component and offsets first.
 
 ## How The External Works
 
@@ -340,7 +370,7 @@ For a game you own or are authorized to inspect:
 8. For runtime object-cache ESP, start with the default `UnityEngine.Rigidbody` test component or enter your own component name such as `PlayerController`.
 9. On Mono, provide the matching object/vtable pointer(s). On IL2CPP, leave `Auto Resolve IL2CPP Class Pointers` enabled or provide the matching `Il2CppClass*`/header pointer(s) manually.
 10. Refresh the cache, then click `Draw Cache In Visual`.
-11. In Visual, set `Entity Source` to `Fast tracked positions` when available, enable `Draw Visuals`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen. If there are fewer than five unique objects, leave `Few-Sample Matrix Guess` enabled to let the external try the lower-confidence matrix scan.
+11. In Visual, set `Entity Source` to `Fast tracked positions` when available, enable `Draw Visuals`, choose the correct position mode/offsets, and provide the view-projection matrix address for world-to-screen. If the internal is available for calibration, export the internal profile and load it externally before tuning offsets. If there are fewer than five unique objects, leave `Few-Sample Matrix Guess` enabled to let the external try the lower-confidence matrix scan.
 12. Watch `Fast targets` in Visual or the fast target table in Developer. Those counters should update every frame while boxes/snaplines/radar are active; use `Auto Rebuild Cache` only for periodic full rediscovery of spawned/despawned objects.
 13. Use internal component/object diagnostics when you need to discover the exact component name, GameObject relationship, Mono object/vtable pointer, IL2CPP class pointer, or native position offsets.
 14. Use manual external ESP/radar only after you know the target entity list, position offsets, and camera matrix address for your build.
@@ -357,9 +387,10 @@ For best results, start with a small Unity test scene that has a known `UnityEng
 - No Lua execution externally.
 - No memory writes or patching.
 - Direct Mono invocation through `mono_runtime_invoke` remains internal-only because a real call must execute inside the target process.
-- External object caching resolves component metadata names and caches live candidates from supplied Mono object/vtable pointers or IL2CPP class/header pointers; it is not a full automatic managed heap walker yet.
+- External object caching resolves component metadata names, can build a read-only Transform/GameObject companion index, and can cache live candidates from supplied Mono object/vtable pointers or IL2CPP class/header pointers; it is not a full automatic managed heap walker yet.
 - External IL2CPP class-pointer auto-resolution is best-effort and depends on readable metadata strings plus the configured `Il2CppClass` name/namespace offsets.
-- External object-cache ESP needs a correct position extraction mode, position offsets, and view-projection matrix address.
+- External object-cache ESP needs correct object discovery plus either a valid Transform-backed position route or correct position offsets, and it still needs a valid view-projection matrix address or successful matrix scan.
+- Full internal parity from outside the process is possible only when the external can reconstruct the same Transform and camera/matrix data or when you provide/profile the missing route. The internal profile bridge exists to make that calibration fast and visible.
 - IL2CPP auto-map generation depends on metadata layout and may fail on custom or unsupported Unity builds.
 - Mono metadata-map generation depends on standard managed assembly metadata in `_Data\Managed`.
 - Offset-driven ESP/radar requires game-specific addresses and structure offsets.

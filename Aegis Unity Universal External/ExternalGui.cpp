@@ -100,6 +100,14 @@ namespace Aegis::UnityExternal
             float z = 0.0f;
         };
 
+        struct Vec4
+        {
+            float x = 0.0f;
+            float y = 0.0f;
+            float z = 0.0f;
+            float w = 0.0f;
+        };
+
         struct EspEntity
         {
             uintptr_t address = 0;
@@ -114,10 +122,13 @@ namespace Aegis::UnityExternal
             uintptr_t address = 0;
             uintptr_t matchedPointer = 0;
             uintptr_t positionAddress = 0;
+            uintptr_t transformBase = 0;
             Vec3 position;
             bool hasPosition = false;
+            bool positionFromTransform = false;
             std::string label;
             std::string source;
+            std::string positionRoute;
         };
 
         struct ObjectCacheTarget
@@ -128,11 +139,21 @@ namespace Aegis::UnityExternal
             std::string source;
         };
 
+        struct ManagedNativeObject
+        {
+            uintptr_t managedAddress = 0;
+            uintptr_t nativePointer = 0;
+            uintptr_t matchedPointer = 0;
+            std::string label;
+            std::string source;
+        };
+
         struct FastTrackedTarget
         {
             uintptr_t objectAddress = 0;
             uintptr_t matchedPointer = 0;
             uintptr_t positionAddress = 0;
+            uintptr_t transformBase = 0;
             uintptr_t cachedPtr = 0;
             std::int64_t objectToPositionOffset = 0;
             std::int64_t cachedPtrToPositionOffset = 0;
@@ -141,6 +162,7 @@ namespace Aegis::UnityExternal
             Vec3 lastGoodPosition;
             bool hasPosition = false;
             bool hasLastGoodPosition = false;
+            bool positionFromTransform = false;
             bool likelyPlayer = false;
             int score = 0;
             int staleReads = 0;
@@ -148,6 +170,7 @@ namespace Aegis::UnityExternal
             ULONGLONG lastFallbackProbeTick = 0;
             std::string label;
             std::string source;
+            std::string positionRoute;
             std::string offsetSummary;
         };
 
@@ -193,8 +216,12 @@ namespace Aegis::UnityExternal
             bool objectCacheAutoResolveMono = true;
             bool objectCacheAutoResolveIl2Cpp = true;
             bool objectCacheRequireCachedPtr = true;
+            bool objectCacheUseMetadataFallbacks = false;
             int classScanMaxMs = 12000;
             int objectCacheScanMaxMs = 20000;
+            bool autoBuildUnityObjectIndex = true;
+            int unityObjectIndexMaxResults = 4096;
+            int nativeCompanionScanBytes = 0x800;
             int monoClassNameOffset = 0x30;
             int monoClassNamespaceOffset = 0x38;
             int monoVTableClassOffset = 0;
@@ -204,6 +231,7 @@ namespace Aegis::UnityExternal
             bool autoBuildFastTargets = true;
             bool fastTargetsFallbackToCache = true;
             bool fastTargetsUseLastGood = true;
+            bool allowWeakAutoProbeVisuals = false;
             int maxFastTargets = 64;
             int fastTargetLastGoodMs = 350;
             int fastTargetFallbackProbeMs = 250;
@@ -255,8 +283,12 @@ namespace Aegis::UnityExternal
             std::vector<ScanResult> scanResults;
             std::vector<EspEntity> espEntities;
             std::vector<ObjectCacheEntry> objectCache;
+            std::vector<ManagedNativeObject> transformIndex;
+            std::vector<ManagedNativeObject> gameObjectIndex;
+            std::vector<ManagedNativeObject> cameraIndex;
             std::vector<FastTrackedTarget> fastTargets;
             std::string objectCacheStatus;
+            std::string unityObjectIndexStatus;
             std::size_t objectCachePositionsReadThisFrame = 0;
             std::size_t objectCachePositionFailuresThisFrame = 0;
             std::size_t fastTargetsReadThisFrame = 0;
@@ -280,6 +312,7 @@ namespace Aegis::UnityExternal
         bool IsAllowedMemoryType(DWORD type, bool includeImages);
         bool IsReadableMemoryProtection(DWORD protect);
         bool IsReadableProcessRange(HANDLE process, uintptr_t address, std::size_t size);
+        uintptr_t OffsetAddress(uintptr_t base, int offset);
         void AddUniqueLabel(std::vector<std::string>* labels, std::string label);
         bool ReadMatrix4x4(const ExternalMemoryReader& reader, const std::string& addressText, std::array<float, 16>* matrix);
         bool WorldToScreen(const Vec3& position, const std::array<float, 16>& matrix, int layout, const ImVec2& screenSize, ImVec2* out);
@@ -287,6 +320,7 @@ namespace Aegis::UnityExternal
         Vec3 EntityHeadFromPosition(const GuiState& state, const Vec3& position);
         bool IsNearScreen(const ImVec2& point, const ImVec2& screenSize, float marginScale);
         bool IsOnScreen(const ImVec2& point, const ImVec2& screenSize);
+        bool ReadTransformAccessWorldPosition(const GuiState& state, uintptr_t transformBase, Vec3* position, uintptr_t* positionAddress);
         void RebuildFastTargetsFromObjectCache(GuiState* state, bool logResult);
         void RefreshFastTargetLivePositions(GuiState* state);
         void RescoreFastTargets(GuiState* state);
@@ -380,6 +414,16 @@ namespace Aegis::UnityExternal
             return ExternalExecutableDirectory() / L"AegisUnityUniversalExternal.ini";
         }
 
+        std::filesystem::path SharedExternalProfilePath()
+        {
+            std::wstring appData(MAX_PATH, L'\0');
+            const DWORD size = GetEnvironmentVariableW(L"APPDATA", appData.data(), static_cast<DWORD>(appData.size()));
+            std::filesystem::path directory = size > 0
+                ? std::filesystem::path(appData.c_str()) / L"AegisUnityUniversal"
+                : ExternalExecutableDirectory();
+            return directory / L"external_profile.ini";
+        }
+
         std::wstring ConfigValue(const std::wstring& line, const wchar_t* key)
         {
             const std::wstring prefix = std::wstring(key) + L"=";
@@ -402,15 +446,150 @@ namespace Aegis::UnityExternal
             std::wstring lastTarget;
             std::wstring lastMethodMap;
             std::wstring line;
+            const auto parseBool = [](const std::wstring& value) {
+                return value == L"1" || value == L"true" || value == L"True";
+            };
+            const auto parseInt = [](const std::wstring& value, int fallback) {
+                wchar_t* end = nullptr;
+                const long parsed = std::wcstol(value.c_str(), &end, 0);
+                return end && *end == L'\0' ? static_cast<int>(parsed) : fallback;
+            };
+            const auto parseFloat = [](const std::wstring& value, float fallback) {
+                wchar_t* end = nullptr;
+                const float parsed = std::wcstof(value.c_str(), &end);
+                return end && *end == L'\0' ? parsed : fallback;
+            };
+
             while (std::getline(file, line))
             {
-                if (std::wstring value = ConfigValue(Trim(line), L"last_target"); !value.empty())
+                const std::wstring trimmed = Trim(line);
+                if (std::wstring value = ConfigValue(trimmed, L"last_target"); !value.empty())
                 {
                     lastTarget = value;
                 }
-                else if (value = ConfigValue(Trim(line), L"last_method_map"); !value.empty())
+                else if (value = ConfigValue(trimmed, L"last_method_map"); !value.empty())
                 {
                     lastMethodMap = value;
+                }
+                else if (value = ConfigValue(trimmed, L"object_cache_component"); !value.empty())
+                {
+                    CopyToBuffer(state->objectCacheComponentName, sizeof(state->objectCacheComponentName), WideToUtf8(value));
+                }
+                else if (value = ConfigValue(trimmed, L"object_cache_fallback"); !value.empty())
+                {
+                    CopyToBuffer(state->objectCacheFallbackComponentName, sizeof(state->objectCacheFallbackComponentName), WideToUtf8(value));
+                }
+                else if (value = ConfigValue(trimmed, L"object_cache_use_fallback"); !value.empty())
+                {
+                    state->objectCacheUseFallback = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"object_cache_require_cached_ptr"); !value.empty())
+                {
+                    state->objectCacheRequireCachedPtr = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"metadata_fallback_labels"); !value.empty())
+                {
+                    state->objectCacheUseMetadataFallbacks = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"auto_resolve_mono_vtables"); !value.empty())
+                {
+                    state->objectCacheAutoResolveMono = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"auto_resolve_il2cpp_classes"); !value.empty())
+                {
+                    state->objectCacheAutoResolveIl2Cpp = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"class_scan_ms"); !value.empty())
+                {
+                    state->classScanMaxMs = parseInt(value, state->classScanMaxMs);
+                }
+                else if (value = ConfigValue(trimmed, L"object_cache_scan_ms"); !value.empty())
+                {
+                    state->objectCacheScanMaxMs = parseInt(value, state->objectCacheScanMaxMs);
+                }
+                else if (value = ConfigValue(trimmed, L"unity_object_index"); !value.empty())
+                {
+                    state->autoBuildUnityObjectIndex = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"unity_object_index_max"); !value.empty())
+                {
+                    state->unityObjectIndexMaxResults = parseInt(value, state->unityObjectIndexMaxResults);
+                }
+                else if (value = ConfigValue(trimmed, L"companion_scan_bytes"); !value.empty())
+                {
+                    state->nativeCompanionScanBytes = parseInt(value, state->nativeCompanionScanBytes);
+                }
+                else if (value = ConfigValue(trimmed, L"object_position_mode"); !value.empty())
+                {
+                    state->objectPositionMode = parseInt(value, state->objectPositionMode);
+                }
+                else if (value = ConfigValue(trimmed, L"object_pointer_offset"); !value.empty())
+                {
+                    state->objectPointerOffset = parseInt(value, state->objectPointerOffset);
+                }
+                else if (value = ConfigValue(trimmed, L"cached_ptr_offset"); !value.empty())
+                {
+                    state->objectCachedPtrOffset = parseInt(value, state->objectCachedPtrOffset);
+                }
+                else if (value = ConfigValue(trimmed, L"transform_pointer_offset"); !value.empty())
+                {
+                    state->objectTransformPointerOffset = parseInt(value, state->objectTransformPointerOffset);
+                }
+                else if (value = ConfigValue(trimmed, L"view_projection"); !value.empty())
+                {
+                    CopyToBuffer(state->viewProjectionAddress, sizeof(state->viewProjectionAddress), WideToUtf8(value));
+                }
+                else if (value = ConfigValue(trimmed, L"matrix_layout"); !value.empty())
+                {
+                    state->matrixLayout = parseInt(value, state->matrixLayout);
+                }
+                else if (value = ConfigValue(trimmed, L"up_axis"); !value.empty())
+                {
+                    state->upAxis = parseInt(value, state->upAxis);
+                }
+                else if (value = ConfigValue(trimmed, L"entity_position_anchor"); !value.empty())
+                {
+                    state->entityPositionAnchor = parseInt(value, state->entityPositionAnchor);
+                }
+                else if (value = ConfigValue(trimmed, L"entity_height"); !value.empty())
+                {
+                    state->entityHeight = parseFloat(value, state->entityHeight);
+                }
+                else if (value = ConfigValue(trimmed, L"entity_head_offset"); !value.empty())
+                {
+                    state->entityHeadOffset = parseFloat(value, state->entityHeadOffset);
+                }
+                else if (value = ConfigValue(trimmed, L"entity_feet_offset"); !value.empty())
+                {
+                    state->entityFeetOffset = parseFloat(value, state->entityFeetOffset);
+                }
+                else if (value = ConfigValue(trimmed, L"auto_build_fast_targets"); !value.empty())
+                {
+                    state->autoBuildFastTargets = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"fast_targets_cache_fallback"); !value.empty())
+                {
+                    state->fastTargetsFallbackToCache = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"smooth_fast_targets"); !value.empty())
+                {
+                    state->fastTargetsUseLastGood = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"allow_weak_auto_probe_visuals"); !value.empty())
+                {
+                    state->allowWeakAutoProbeVisuals = parseBool(value);
+                }
+                else if (value = ConfigValue(trimmed, L"fast_hold_last_good_ms"); !value.empty())
+                {
+                    state->fastTargetLastGoodMs = parseInt(value, state->fastTargetLastGoodMs);
+                }
+                else if (value = ConfigValue(trimmed, L"fast_fallback_probe_ms"); !value.empty())
+                {
+                    state->fastTargetFallbackProbeMs = parseInt(value, state->fastTargetFallbackProbeMs);
+                }
+                else if (value = ConfigValue(trimmed, L"max_fast_targets"); !value.empty())
+                {
+                    state->maxFastTargets = parseInt(value, state->maxFastTargets);
                 }
             }
 
@@ -433,6 +612,36 @@ namespace Aegis::UnityExternal
 
             file << L"last_target=" << Utf8ToWide(state.target) << L'\n';
             file << L"last_method_map=" << Utf8ToWide(state.methodMapPath) << L'\n';
+            file << L"object_cache_component=" << Utf8ToWide(state.objectCacheComponentName) << L'\n';
+            file << L"object_cache_fallback=" << Utf8ToWide(state.objectCacheFallbackComponentName) << L'\n';
+            file << L"object_cache_use_fallback=" << (state.objectCacheUseFallback ? 1 : 0) << L'\n';
+            file << L"object_cache_require_cached_ptr=" << (state.objectCacheRequireCachedPtr ? 1 : 0) << L'\n';
+            file << L"metadata_fallback_labels=" << (state.objectCacheUseMetadataFallbacks ? 1 : 0) << L'\n';
+            file << L"auto_resolve_mono_vtables=" << (state.objectCacheAutoResolveMono ? 1 : 0) << L'\n';
+            file << L"auto_resolve_il2cpp_classes=" << (state.objectCacheAutoResolveIl2Cpp ? 1 : 0) << L'\n';
+            file << L"class_scan_ms=" << state.classScanMaxMs << L'\n';
+            file << L"object_cache_scan_ms=" << state.objectCacheScanMaxMs << L'\n';
+            file << L"unity_object_index=" << (state.autoBuildUnityObjectIndex ? 1 : 0) << L'\n';
+            file << L"unity_object_index_max=" << state.unityObjectIndexMaxResults << L'\n';
+            file << L"companion_scan_bytes=" << state.nativeCompanionScanBytes << L'\n';
+            file << L"object_position_mode=" << state.objectPositionMode << L'\n';
+            file << L"object_pointer_offset=" << state.objectPointerOffset << L'\n';
+            file << L"cached_ptr_offset=" << state.objectCachedPtrOffset << L'\n';
+            file << L"transform_pointer_offset=" << state.objectTransformPointerOffset << L'\n';
+            file << L"view_projection=" << Utf8ToWide(state.viewProjectionAddress) << L'\n';
+            file << L"matrix_layout=" << state.matrixLayout << L'\n';
+            file << L"up_axis=" << state.upAxis << L'\n';
+            file << L"entity_position_anchor=" << state.entityPositionAnchor << L'\n';
+            file << L"entity_height=" << state.entityHeight << L'\n';
+            file << L"entity_head_offset=" << state.entityHeadOffset << L'\n';
+            file << L"entity_feet_offset=" << state.entityFeetOffset << L'\n';
+            file << L"auto_build_fast_targets=" << (state.autoBuildFastTargets ? 1 : 0) << L'\n';
+            file << L"fast_targets_cache_fallback=" << (state.fastTargetsFallbackToCache ? 1 : 0) << L'\n';
+            file << L"smooth_fast_targets=" << (state.fastTargetsUseLastGood ? 1 : 0) << L'\n';
+            file << L"allow_weak_auto_probe_visuals=" << (state.allowWeakAutoProbeVisuals ? 1 : 0) << L'\n';
+            file << L"fast_hold_last_good_ms=" << state.fastTargetLastGoodMs << L'\n';
+            file << L"fast_fallback_probe_ms=" << state.fastTargetFallbackProbeMs << L'\n';
+            file << L"max_fast_targets=" << state.maxFastTargets << L'\n';
         }
 
         std::optional<std::uint64_t> ParseUnsignedInteger(const std::string& text)
@@ -566,6 +775,238 @@ namespace Aegis::UnityExternal
             }
         }
 
+        bool LoadInternalExternalProfile(GuiState* state)
+        {
+            if (!state)
+            {
+                return false;
+            }
+
+            const std::filesystem::path path = SharedExternalProfilePath();
+            std::wifstream file{ path };
+            if (!file)
+            {
+                AddLog(state, "No internal external-profile file found at %s.", WideToUtf8(path.wstring()).c_str());
+                return false;
+            }
+
+            const auto parseBool = [](const std::wstring& value) {
+                return value == L"1" || value == L"true" || value == L"True";
+            };
+            const auto parseInt = [](const std::wstring& value, int fallback) {
+                wchar_t* end = nullptr;
+                const long parsed = std::wcstol(value.c_str(), &end, 0);
+                return end && *end == L'\0' ? static_cast<int>(parsed) : fallback;
+            };
+            const auto parseFloat = [](const std::wstring& value, float fallback) {
+                wchar_t* end = nullptr;
+                const float parsed = std::wcstof(value.c_str(), &end);
+                return end && *end == L'\0' ? parsed : fallback;
+            };
+
+            std::wstring line;
+            std::vector<std::wstring> profileLines;
+            int applied = 0;
+            while (std::getline(file, line))
+            {
+                const std::wstring trimmed = Trim(line);
+                if (trimmed.empty() || trimmed[0] == L'#')
+                {
+                    continue;
+                }
+                profileLines.push_back(trimmed);
+
+                std::wstring value;
+                if (value = ConfigValue(trimmed, L"object_cache_component"); !value.empty())
+                {
+                    CopyToBuffer(state->objectCacheComponentName, sizeof(state->objectCacheComponentName), WideToUtf8(value));
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"object_cache_fallback"); !value.empty())
+                {
+                    CopyToBuffer(state->objectCacheFallbackComponentName, sizeof(state->objectCacheFallbackComponentName), WideToUtf8(value));
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"object_cache_use_fallback"); !value.empty())
+                {
+                    state->objectCacheUseFallback = parseBool(value);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"object_position_mode"); !value.empty())
+                {
+                    state->objectPositionMode = parseInt(value, state->objectPositionMode);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"cached_ptr_offset"); !value.empty())
+                {
+                    state->objectCachedPtrOffset = parseInt(value, state->objectCachedPtrOffset);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"unity_object_index"); !value.empty())
+                {
+                    state->autoBuildUnityObjectIndex = parseBool(value);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"auto_build_fast_targets"); !value.empty())
+                {
+                    state->autoBuildFastTargets = parseBool(value);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"fast_targets_cache_fallback"); !value.empty())
+                {
+                    state->fastTargetsFallbackToCache = parseBool(value);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"entity_position_anchor"); !value.empty())
+                {
+                    state->entityPositionAnchor = parseInt(value, state->entityPositionAnchor);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"up_axis"); !value.empty())
+                {
+                    state->upAxis = parseInt(value, state->upAxis);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"entity_height"); !value.empty())
+                {
+                    state->entityHeight = parseFloat(value, state->entityHeight);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"entity_head_offset"); !value.empty())
+                {
+                    state->entityHeadOffset = parseFloat(value, state->entityHeadOffset);
+                    ++applied;
+                }
+                else if (value = ConfigValue(trimmed, L"entity_feet_offset"); !value.empty())
+                {
+                    state->entityFeetOffset = parseFloat(value, state->entityFeetOffset);
+                    ++applied;
+                }
+            }
+
+            const auto profileValue = [&](const std::wstring& key) -> std::wstring {
+                for (const std::wstring& profileLine : profileLines)
+                {
+                    std::wstring value = ConfigValue(profileLine, key.c_str());
+                    if (!value.empty())
+                    {
+                        return value;
+                    }
+                }
+                return {};
+            };
+            const auto parseAddress = [](const std::wstring& value) -> uintptr_t {
+                if (value.empty())
+                {
+                    return 0;
+                }
+                wchar_t* end = nullptr;
+                const unsigned long long parsed = std::wcstoull(value.c_str(), &end, 0);
+                return end && *end == L'\0' ? static_cast<uintptr_t>(parsed) : 0;
+            };
+
+            std::size_t loadedProfileTargets = 0;
+            if (state->reader.IsOpen())
+            {
+                const auto addProfileTarget = [&](const char* label, uintptr_t objectAddress, uintptr_t componentAddress, uintptr_t transformAddress) {
+                    if (transformAddress == 0 ||
+                        state->fastTargets.size() >= static_cast<std::size_t>(std::clamp(state->maxFastTargets, 1, 4096)))
+                    {
+                        return;
+                    }
+
+                    uintptr_t transformBase = transformAddress;
+                    Vec3 position{};
+                    uintptr_t positionAddress = 0;
+                    if (!ReadTransformAccessWorldPosition(*state, transformBase, &position, &positionAddress))
+                    {
+                        const std::optional<uintptr_t> nativeTransform =
+                            state->reader.Read<uintptr_t>(OffsetAddress(transformAddress, state->objectCachedPtrOffset));
+                        if (!nativeTransform ||
+                            !ReadTransformAccessWorldPosition(*state, *nativeTransform, &position, &positionAddress))
+                        {
+                            return;
+                        }
+                        transformBase = *nativeTransform;
+                    }
+
+                    const auto exists = std::find_if(state->fastTargets.begin(), state->fastTargets.end(), [&](const FastTrackedTarget& existing) {
+                        return existing.transformBase == transformBase ||
+                            (objectAddress != 0 && existing.objectAddress == objectAddress);
+                    });
+                    if (exists != state->fastTargets.end())
+                    {
+                        return;
+                    }
+
+                    FastTrackedTarget target;
+                    target.objectAddress = componentAddress != 0
+                        ? componentAddress
+                        : (objectAddress != 0 ? objectAddress : transformAddress);
+                    target.positionAddress = positionAddress;
+                    target.transformBase = transformBase;
+                    target.position = position;
+                    target.lastGoodPosition = position;
+                    target.hasPosition = true;
+                    target.hasLastGoodPosition = true;
+                    target.positionFromTransform = true;
+                    target.lastGoodReadTick = GetTickCount64();
+                    target.positionShareCount = 1;
+                    target.label = label ? label : "internal profile";
+                    target.source = "internal exported profile";
+                    target.positionRoute = "internal profile -> TransformAccess hierarchy";
+                    target.offsetSummary = "internal profile";
+                    if (componentAddress != 0)
+                    {
+                        target.offsetSummary += " component " + FormatHex(componentAddress);
+                    }
+                    if (objectAddress != 0)
+                    {
+                        target.offsetSummary += " gameobject " + FormatHex(objectAddress);
+                    }
+                    target.offsetSummary += " transform " + FormatHex(transformBase);
+                    target.score = 900;
+                    state->fastTargets.push_back(std::move(target));
+                    ++loadedProfileTargets;
+                };
+
+                for (const char* prefix : { "player", "object" })
+                {
+                    for (int index = 0; index < 64; ++index)
+                    {
+                        const std::wstring baseKey = Utf8ToWide(prefix) + L"_" + std::to_wstring(index);
+                        const uintptr_t objectAddress = parseAddress(profileValue(baseKey + L"_gameobject"));
+                        const uintptr_t componentAddress = parseAddress(profileValue(baseKey + L"_component"));
+                        const uintptr_t transformAddress = parseAddress(profileValue(baseKey + L"_transform"));
+                        if (objectAddress == 0 && transformAddress == 0)
+                        {
+                            continue;
+                        }
+
+                        const std::string label = WideToUtf8(profileValue(baseKey + L"_component_name"));
+                        addProfileTarget(label.empty() ? prefix : label.c_str(), objectAddress, componentAddress, transformAddress);
+                    }
+                }
+
+                if (loadedProfileTargets > 0)
+                {
+                    RescoreFastTargets(state);
+                    state->entitySource = 2;
+                    state->espEnabled = true;
+                    state->espBoxes = true;
+                    state->espSnaplines = true;
+                }
+            }
+
+            AddLog(
+                state,
+                "Loaded internal external-profile from %s (%d setting(s), %zu live profile target(s)).",
+                WideToUtf8(path.wstring()).c_str(),
+                applied,
+                loadedProfileTargets);
+            return applied > 0 || loadedProfileTargets > 0;
+        }
+
         std::string ToLowerAscii(std::string value)
         {
             std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -645,6 +1086,62 @@ namespace Aegis::UnityExternal
 
             *out = *value;
             return true;
+        }
+
+        bool IsFinite(const Vec4& value)
+        {
+            return std::isfinite(value.x) &&
+                std::isfinite(value.y) &&
+                std::isfinite(value.z) &&
+                std::isfinite(value.w);
+        }
+
+        Vec3 AddVec3(const Vec3& left, const Vec3& right)
+        {
+            return Vec3{ left.x + right.x, left.y + right.y, left.z + right.z };
+        }
+
+        Vec3 ScaleVec3(const Vec3& left, const Vec3& right)
+        {
+            return Vec3{ left.x * right.x, left.y * right.y, left.z * right.z };
+        }
+
+        Vec3 CrossVec3(const Vec3& left, const Vec3& right)
+        {
+            return Vec3{
+                left.y * right.z - left.z * right.y,
+                left.z * right.x - left.x * right.z,
+                left.x * right.y - left.y * right.x
+            };
+        }
+
+        Vec3 RotateVec3ByQuaternion(Vec3 value, Vec4 rotation)
+        {
+            const float lengthSquared =
+                rotation.x * rotation.x +
+                rotation.y * rotation.y +
+                rotation.z * rotation.z +
+                rotation.w * rotation.w;
+            if (!std::isfinite(lengthSquared) || lengthSquared < 0.000001f)
+            {
+                return value;
+            }
+
+            const float inverseLength = 1.0f / std::sqrt(lengthSquared);
+            rotation.x *= inverseLength;
+            rotation.y *= inverseLength;
+            rotation.z *= inverseLength;
+            rotation.w *= inverseLength;
+
+            const Vec3 q{ rotation.x, rotation.y, rotation.z };
+            const Vec3 t = CrossVec3(q, value);
+            const Vec3 doubledT{ t.x * 2.0f, t.y * 2.0f, t.z * 2.0f };
+            const Vec3 qCrossT = CrossVec3(q, doubledT);
+            return Vec3{
+                value.x + rotation.w * doubledT.x + qCrossT.x,
+                value.y + rotation.w * doubledT.y + qCrossT.y,
+                value.z + rotation.w * doubledT.z + qCrossT.z
+            };
         }
 
         bool IsPlausibleObjectPosition(const GuiState& state, const Vec3& value)
@@ -734,6 +1231,327 @@ namespace Aegis::UnityExternal
             return true;
         }
 
+        struct TransformHierarchyEntry
+        {
+            Vec4 translation{};
+            Vec4 rotation{};
+            Vec4 scale{};
+        };
+
+        bool ReadTransformHierarchyEntry(
+            const GuiState& state,
+            uintptr_t matrixList,
+            int index,
+            TransformHierarchyEntry* entry,
+            uintptr_t* entryAddress)
+        {
+            if (!entry || index < 0 || index > 0x200000)
+            {
+                return false;
+            }
+
+            constexpr uintptr_t kMatrixStride = 0x30;
+            const uintptr_t address = matrixList + static_cast<uintptr_t>(index) * kMatrixStride;
+            if (!IsLikelyDynamicDataAddress(state, address, sizeof(TransformHierarchyEntry)) ||
+                !state.reader.ReadRaw(address, entry, sizeof(TransformHierarchyEntry)) ||
+                !IsFinite(entry->translation) ||
+                !IsFinite(entry->rotation) ||
+                !IsFinite(entry->scale))
+            {
+                return false;
+            }
+
+            const float rotationLengthSquared =
+                entry->rotation.x * entry->rotation.x +
+                entry->rotation.y * entry->rotation.y +
+                entry->rotation.z * entry->rotation.z +
+                entry->rotation.w * entry->rotation.w;
+            if (!std::isfinite(rotationLengthSquared) ||
+                rotationLengthSquared < 0.20f ||
+                rotationLengthSquared > 2.50f)
+            {
+                return false;
+            }
+
+            if (std::abs(entry->scale.x) > 10000.0f ||
+                std::abs(entry->scale.y) > 10000.0f ||
+                std::abs(entry->scale.z) > 10000.0f ||
+                (std::abs(entry->scale.x) < 0.000001f &&
+                    std::abs(entry->scale.y) < 0.000001f &&
+                    std::abs(entry->scale.z) < 0.000001f))
+            {
+                return false;
+            }
+
+            if (entryAddress)
+            {
+                *entryAddress = address;
+            }
+            return true;
+        }
+
+        bool ReadTransformHierarchyWorldPosition(
+            const GuiState& state,
+            uintptr_t matrixList,
+            uintptr_t parentIndexList,
+            int transformIndex,
+            Vec3* position,
+            uintptr_t* positionAddress,
+            int* hierarchyDepth)
+        {
+            if (!position || !positionAddress ||
+                matrixList == 0 ||
+                parentIndexList == 0 ||
+                transformIndex < 0 ||
+                transformIndex > 0x200000)
+            {
+                return false;
+            }
+
+            TransformHierarchyEntry entry{};
+            uintptr_t localAddress = 0;
+            if (!ReadTransformHierarchyEntry(state, matrixList, transformIndex, &entry, &localAddress))
+            {
+                return false;
+            }
+
+            Vec3 accumulated{ entry.translation.x, entry.translation.y, entry.translation.z };
+            if (!IsPlausibleObjectPosition(state, accumulated))
+            {
+                return false;
+            }
+
+            const uintptr_t firstParentIndexAddress = parentIndexList + static_cast<uintptr_t>(transformIndex) * sizeof(int);
+            if (!IsLikelyDynamicDataAddress(state, firstParentIndexAddress, sizeof(int)))
+            {
+                return false;
+            }
+
+            const std::optional<int> firstParentIndex = state.reader.Read<int>(firstParentIndexAddress);
+            if (!firstParentIndex || *firstParentIndex < -1 || *firstParentIndex > 0x200000)
+            {
+                return false;
+            }
+
+            int depth = 0;
+            int currentIndex = transformIndex;
+            std::array<int, 128> visited{};
+            std::size_t visitedCount = 0;
+            while (depth < 127)
+            {
+                const uintptr_t parentIndexAddress = parentIndexList + static_cast<uintptr_t>(currentIndex) * sizeof(int);
+                if (!IsLikelyDynamicDataAddress(state, parentIndexAddress, sizeof(int)))
+                {
+                    break;
+                }
+
+                const std::optional<int> parentIndex = state.reader.Read<int>(parentIndexAddress);
+                if (!parentIndex || *parentIndex < -1 || *parentIndex > 0x200000)
+                {
+                    return false;
+                }
+                if (*parentIndex < 0 || *parentIndex == currentIndex)
+                {
+                    break;
+                }
+
+                bool seen = false;
+                for (std::size_t index = 0; index < visitedCount; ++index)
+                {
+                    if (visited[index] == *parentIndex)
+                    {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen)
+                {
+                    break;
+                }
+                if (visitedCount < visited.size())
+                {
+                    visited[visitedCount++] = *parentIndex;
+                }
+
+                TransformHierarchyEntry parent{};
+                if (!ReadTransformHierarchyEntry(state, matrixList, *parentIndex, &parent, nullptr))
+                {
+                    break;
+                }
+
+                accumulated = AddVec3(
+                    Vec3{ parent.translation.x, parent.translation.y, parent.translation.z },
+                    RotateVec3ByQuaternion(
+                        ScaleVec3(accumulated, Vec3{ parent.scale.x, parent.scale.y, parent.scale.z }),
+                        parent.rotation));
+                if (!IsPlausibleObjectPosition(state, accumulated))
+                {
+                    return false;
+                }
+
+                currentIndex = *parentIndex;
+                ++depth;
+            }
+
+            *position = accumulated;
+            *positionAddress = localAddress;
+            if (hierarchyDepth)
+            {
+                *hierarchyDepth = depth;
+            }
+            return true;
+        }
+
+        bool ReadTransformAccessWorldPosition(
+            const GuiState& state,
+            uintptr_t transformBase,
+            Vec3* position,
+            uintptr_t* positionAddress)
+        {
+            if (!position || !positionAddress || transformBase == 0 || !state.reader.IsOpen())
+            {
+                return false;
+            }
+
+            std::vector<uintptr_t> accessBases;
+            AddUniqueProbeBase(&accessBases, transformBase);
+            for (int pointerOffset : { 0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38 })
+            {
+                const std::optional<uintptr_t> accessBase =
+                    state.reader.Read<uintptr_t>(OffsetAddress(transformBase, pointerOffset));
+                if (accessBase &&
+                    *accessBase != 0 &&
+                    *accessBase != transformBase &&
+                    IsLikelyDynamicDataAddress(state, *accessBase, sizeof(uintptr_t) * 8))
+                {
+                    AddUniqueProbeBase(&accessBases, *accessBase);
+                }
+            }
+
+            struct Candidate
+            {
+                Vec3 position{};
+                uintptr_t address = 0;
+                int score = std::numeric_limits<int>::min();
+            } best;
+
+            const auto scorePosition = [&](const Vec3& value, uintptr_t address, int sourceScore, int hierarchyDepth) {
+                int score = sourceScore + hierarchyDepth * 6;
+
+                const float magnitude =
+                    std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
+                if (std::isfinite(magnitude) && magnitude >= 0.05f)
+                {
+                    score += 8;
+                }
+
+                const float vertical = state.upAxis == 1 ? value.z : value.y;
+                if (std::isfinite(vertical) && vertical >= -50.0f && vertical <= 500.0f)
+                {
+                    score += 10;
+                }
+
+                if (address < 0x10000000)
+                {
+                    score -= 24;
+                }
+
+                return score;
+            };
+
+            const auto consider = [&](const Vec3& value, uintptr_t address, int sourceScore, int hierarchyDepth) {
+                if (!IsPlausibleObjectPosition(state, value))
+                {
+                    return;
+                }
+
+                const int score = scorePosition(value, address, sourceScore, hierarchyDepth);
+                if (score > best.score)
+                {
+                    best = Candidate{ value, address, score };
+                }
+            };
+
+            constexpr std::array<int, 4> kTransformDataOffsets = { 0x38, 0x30, 0x40, 0x28 };
+            constexpr std::array<int, 4> kTransformIndexOffsets = { 0x40, 0x38, 0x48, 0x30 };
+            struct TransformDataLayout
+            {
+                int matrixListOffset = 0;
+                int parentIndexListOffset = 0;
+                int score = 0;
+            };
+            constexpr std::array<TransformDataLayout, 4> kTransformDataLayouts = {
+                TransformDataLayout{ 0x18, 0x20, 40 },
+                TransformDataLayout{ 0x10, 0x18, 18 },
+                TransformDataLayout{ 0x20, 0x28, 12 },
+                TransformDataLayout{ 0x0, 0x8, 4 }
+            };
+            for (uintptr_t accessBase : accessBases)
+            {
+                for (int transformDataOffset : kTransformDataOffsets)
+                {
+                    const std::optional<uintptr_t> transformData =
+                        state.reader.Read<uintptr_t>(OffsetAddress(accessBase, transformDataOffset));
+                    if (!transformData || *transformData == 0 ||
+                        !IsReadableProcessRange(state.reader.ProcessHandle(), *transformData, sizeof(uintptr_t) * 4))
+                    {
+                        continue;
+                    }
+
+                    for (int transformIndexOffset : kTransformIndexOffsets)
+                    {
+                        const std::optional<int> transformIndex =
+                            state.reader.Read<int>(OffsetAddress(accessBase, transformIndexOffset));
+                        if (!transformIndex || *transformIndex < 0 || *transformIndex > 0x200000)
+                        {
+                            continue;
+                        }
+
+                        for (const TransformDataLayout& layout : kTransformDataLayouts)
+                        {
+                            const std::optional<uintptr_t> matrixList =
+                                state.reader.Read<uintptr_t>(OffsetAddress(*transformData, layout.matrixListOffset));
+                            const std::optional<uintptr_t> parentIndexList =
+                                state.reader.Read<uintptr_t>(OffsetAddress(*transformData, layout.parentIndexListOffset));
+                            if (!matrixList || *matrixList == 0 ||
+                                !parentIndexList || *parentIndexList == 0)
+                            {
+                                continue;
+                            }
+
+                            Vec3 hierarchyPosition{};
+                            uintptr_t hierarchyAddress = 0;
+                            int hierarchyDepth = 0;
+                            if (ReadTransformHierarchyWorldPosition(
+                                state,
+                                *matrixList,
+                                *parentIndexList,
+                                *transformIndex,
+                                &hierarchyPosition,
+                                &hierarchyAddress,
+                                &hierarchyDepth))
+                            {
+                                int sourceScore = 180 + layout.score;
+                                sourceScore -= transformDataOffset == 0x38 ? 0 : 10;
+                                sourceScore -= transformIndexOffset == 0x40 ? 0 : 10;
+                                consider(hierarchyPosition, hierarchyAddress, sourceScore, hierarchyDepth);
+                            }
+
+                        }
+                    }
+                }
+            }
+
+            if (best.address == 0)
+            {
+                return false;
+            }
+
+            *position = best.position;
+            *positionAddress = best.address;
+            return true;
+        }
+
         bool IsLikelyUnityNativePointer(uintptr_t managedObjectAddress, uintptr_t nativePointer)
         {
             if (managedObjectAddress == 0 || nativePointer == 0 || (nativePointer % sizeof(uintptr_t)) != 0)
@@ -748,6 +1566,44 @@ namespace Aegis::UnityExternal
             return distance >= 0x10000;
         }
 
+        bool IsProcessImageAddress(const GuiState& state, uintptr_t address)
+        {
+            if (!state.reader.ProcessHandle() || address == 0)
+            {
+                return false;
+            }
+
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQueryEx(state.reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) != sizeof(mbi))
+            {
+                return false;
+            }
+
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            return address >= base &&
+                address < base + mbi.RegionSize &&
+                mbi.State == MEM_COMMIT &&
+                mbi.Type == MEM_IMAGE &&
+                IsReadableMemoryProtection(mbi.Protect);
+        }
+
+        bool IsLikelyUnityNativeObjectPointer(const GuiState& state, uintptr_t managedObjectAddress, uintptr_t nativePointer)
+        {
+            if (!IsLikelyUnityNativePointer(managedObjectAddress, nativePointer) ||
+                !IsReadableProcessRange(state.reader.ProcessHandle(), nativePointer, sizeof(uintptr_t)))
+            {
+                return false;
+            }
+
+            if (state.process && state.process->modules.Backend() == RuntimeBackend::Mono)
+            {
+                return true;
+            }
+
+            const std::optional<uintptr_t> nativeVTable = state.reader.Read<uintptr_t>(nativePointer);
+            return nativeVTable && IsProcessImageAddress(state, *nativeVTable);
+        }
+
         bool IsAddressNear(uintptr_t left, uintptr_t right, uintptr_t distance)
         {
             if (left == 0 || right == 0)
@@ -759,11 +1615,86 @@ namespace Aegis::UnityExternal
             return delta < distance;
         }
 
+        void AddUniqueManagedNativeObject(
+            std::vector<ManagedNativeObject>* objects,
+            ManagedNativeObject object,
+            std::size_t maxResults)
+        {
+            if (!objects || object.managedAddress == 0 || object.nativePointer == 0 || objects->size() >= maxResults)
+            {
+                return;
+            }
+
+            const auto exists = std::find_if(objects->begin(), objects->end(), [&object](const ManagedNativeObject& existing) {
+                return existing.managedAddress == object.managedAddress ||
+                    existing.nativePointer == object.nativePointer;
+            });
+            if (exists != objects->end())
+            {
+                return;
+            }
+
+            objects->push_back(std::move(object));
+        }
+
+        void SortManagedNativeIndex(std::vector<ManagedNativeObject>* objects)
+        {
+            if (!objects)
+            {
+                return;
+            }
+
+            std::sort(objects->begin(), objects->end(), [](const ManagedNativeObject& left, const ManagedNativeObject& right) {
+                if (left.nativePointer != right.nativePointer)
+                {
+                    return left.nativePointer < right.nativePointer;
+                }
+                return left.managedAddress < right.managedAddress;
+            });
+        }
+
+        const ManagedNativeObject* FindIndexedNativeObject(
+            const std::vector<ManagedNativeObject>& objects,
+            uintptr_t nativePointer)
+        {
+            if (nativePointer == 0)
+            {
+                return nullptr;
+            }
+
+            const auto it = std::lower_bound(
+                objects.begin(),
+                objects.end(),
+                nativePointer,
+                [](const ManagedNativeObject& object, uintptr_t value) {
+                    return object.nativePointer < value;
+                });
+            return it != objects.end() && it->nativePointer == nativePointer ? &*it : nullptr;
+        }
+
+        const ManagedNativeObject* FindIndexedManagedObject(
+            const std::vector<ManagedNativeObject>& objects,
+            uintptr_t managedAddress)
+        {
+            if (managedAddress == 0)
+            {
+                return nullptr;
+            }
+
+            const auto it = std::find_if(objects.begin(), objects.end(), [managedAddress](const ManagedNativeObject& object) {
+                return object.managedAddress == managedAddress;
+            });
+            return it == objects.end() ? nullptr : &*it;
+        }
+
         bool ProbeObjectCachePosition(
             const GuiState& state,
             uintptr_t objectAddress,
             Vec3* position,
-            uintptr_t* positionAddress)
+            uintptr_t* positionAddress,
+            uintptr_t* transformBase = nullptr,
+            bool* positionFromTransform = nullptr,
+            std::string* positionRoute = nullptr)
         {
             if (!position || !positionAddress || objectAddress == 0 || !state.reader.IsOpen())
             {
@@ -774,6 +1705,9 @@ namespace Aegis::UnityExternal
             {
                 Vec3 position{};
                 uintptr_t address = 0;
+                uintptr_t transformBase = 0;
+                bool fromTransform = false;
+                std::string route;
                 int score = std::numeric_limits<int>::min();
             };
 
@@ -784,6 +1718,7 @@ namespace Aegis::UnityExternal
                 ? ImGui::GetIO().DisplaySize
                 : ImVec2(1920.0f, 1080.0f);
             ProbeCandidate best;
+            ProbeCandidate bestTrustedTransform;
 
             const auto scorePositionValue = [&](const Vec3& value, uintptr_t readAddress, int sourceScore) -> int {
                 int score = sourceScore;
@@ -864,7 +1799,7 @@ namespace Aegis::UnityExternal
                 return score;
             };
 
-            const auto considerCandidate = [&](uintptr_t readAddress, int sourceScore) {
+            const auto considerCandidate = [&](uintptr_t readAddress, int sourceScore, const char* route) {
                 Vec3 value{};
                 uintptr_t confirmedAddress = 0;
                 if (!TryReadObjectPositionAt(state, readAddress, &value, &confirmedAddress))
@@ -875,114 +1810,108 @@ namespace Aegis::UnityExternal
                 const int score = scorePositionValue(value, confirmedAddress, sourceScore);
                 if (score > best.score)
                 {
-                    best = ProbeCandidate{ value, confirmedAddress, score };
+                    best = ProbeCandidate{ value, confirmedAddress, 0, false, route ? route : "direct Vec3 probe", score };
                 }
             };
 
-            const auto readTransformAccessCandidate = [&](uintptr_t transformBase, std::size_t translationOffset, Vec3* out, uintptr_t* valueAddress) -> bool {
-                if (!out || !valueAddress || transformBase == 0)
+            const auto considerTransformAccess = [&](uintptr_t transformBase, int sourceScore, bool trustedTransform, const char* route) {
+                Vec3 value{};
+                uintptr_t valueAddress = 0;
+                if (!ReadTransformAccessWorldPosition(state, transformBase, &value, &valueAddress))
                 {
-                    return false;
+                    return;
                 }
 
-                const std::optional<uintptr_t> transformData =
-                    state.reader.Read<uintptr_t>(OffsetAddress(transformBase, 0x38));
-                const std::optional<int> transformIndex =
-                    state.reader.Read<int>(OffsetAddress(transformBase, 0x40));
-                if (!transformData || *transformData == 0 ||
-                    !transformIndex || *transformIndex < 0 || *transformIndex > 0x200000 ||
-                    !IsReadableProcessRange(state.reader.ProcessHandle(), *transformData, sizeof(uintptr_t) * 4))
+                const int score = scorePositionValue(value, valueAddress, sourceScore + (trustedTransform ? 210 : 10));
+                ProbeCandidate& targetBest = trustedTransform ? bestTrustedTransform : best;
+                if (score > targetBest.score)
                 {
-                    return false;
+                    targetBest = ProbeCandidate{ value, valueAddress, transformBase, true, route ? route : "TransformAccess probe", score };
                 }
-
-                const std::optional<uintptr_t> matrixList =
-                    state.reader.Read<uintptr_t>(OffsetAddress(*transformData, 0x18));
-                const std::optional<uintptr_t> parentIndexList =
-                    state.reader.Read<uintptr_t>(OffsetAddress(*transformData, 0x20));
-                if (!matrixList || *matrixList == 0 ||
-                    !parentIndexList || *parentIndexList == 0)
-                {
-                    return false;
-                }
-
-                constexpr uintptr_t kMatrixStride = 0x30;
-                Vec3 accumulated{};
-                uintptr_t matrixAddress =
-                    *matrixList + static_cast<uintptr_t>(*transformIndex) * kMatrixStride + translationOffset;
-                if (!IsLikelyDynamicDataAddress(state, matrixAddress, sizeof(Vec3)) ||
-                    !ReadVec3(state.reader, matrixAddress, &accumulated) ||
-                    !IsPlausibleObjectPosition(state, accumulated))
-                {
-                    return false;
-                }
-
-                int currentIndex = *transformIndex;
-                for (int depth = 0; depth < 64; ++depth)
-                {
-                    const std::optional<int> parentIndex =
-                        state.reader.Read<int>(*parentIndexList + static_cast<uintptr_t>(currentIndex) * sizeof(int));
-                    if (!parentIndex || *parentIndex < 0 || *parentIndex > 0x200000)
-                    {
-                        break;
-                    }
-
-                    Vec3 parentTranslation{};
-                    const uintptr_t parentAddress =
-                        *matrixList + static_cast<uintptr_t>(*parentIndex) * kMatrixStride + translationOffset;
-                    if (!IsLikelyDynamicDataAddress(state, parentAddress, sizeof(Vec3)) ||
-                        !ReadVec3(state.reader, parentAddress, &parentTranslation) ||
-                        !IsPlausibleObjectPosition(state, parentTranslation))
-                    {
-                        break;
-                    }
-
-                    accumulated.x += parentTranslation.x;
-                    accumulated.y += parentTranslation.y;
-                    accumulated.z += parentTranslation.z;
-                    currentIndex = *parentIndex;
-                    if (!IsPlausibleObjectPosition(state, accumulated))
-                    {
-                        break;
-                    }
-                }
-
-                if (!IsPlausibleObjectPosition(state, accumulated))
-                {
-                    return false;
-                }
-
-                *out = accumulated;
-                *valueAddress = matrixAddress;
-                return true;
             };
 
-            const auto considerTransformAccess = [&](uintptr_t transformBase, int sourceScore) {
-                constexpr std::array<std::size_t, 4> kTranslationOffsets = { 0x0, 0x0C, 0x10, 0x20 };
-                for (std::size_t offset : kTranslationOffsets)
+            const std::size_t companionScanBytes = static_cast<std::size_t>(
+                std::clamp(state.nativeCompanionScanBytes, 0, 0x4000));
+            const auto scanManagedForTransformReference = [&](uintptr_t managedAddress, int sourceScore) {
+                if (managedAddress == 0)
                 {
-                    Vec3 value{};
-                    uintptr_t valueAddress = 0;
-                    if (!readTransformAccessCandidate(transformBase, offset, &value, &valueAddress))
+                    return;
+                }
+
+                for (std::size_t offset = sizeof(uintptr_t); offset <= companionScanBytes; offset += sizeof(uintptr_t))
+                {
+                    const std::optional<uintptr_t> pointer = state.reader.Read<uintptr_t>(managedAddress + offset);
+                    if (!pointer || *pointer == 0)
                     {
                         continue;
                     }
 
-                    const int score = scorePositionValue(value, valueAddress, sourceScore + 75);
-                    if (score > best.score)
+                    if (const ManagedNativeObject* transform = FindIndexedManagedObject(state.transformIndex, *pointer))
                     {
-                        best = ProbeCandidate{ value, valueAddress, score };
+                        considerTransformAccess(transform->nativePointer, sourceScore + 145, true, "managed field -> indexed Transform");
                     }
+                    else if (FindIndexedNativeObject(state.transformIndex, *pointer))
+                    {
+                        considerTransformAccess(*pointer, sourceScore + 135, true, "managed field -> native Transform");
+                    }
+                }
+            };
+
+            const auto scanNativeGameObjectForTransform = [&](uintptr_t nativeGameObject, int sourceScore) {
+                if (nativeGameObject == 0 || state.transformIndex.empty())
+                {
+                    return;
+                }
+
+                for (std::size_t offset = 0; offset <= companionScanBytes; offset += sizeof(uintptr_t))
+                {
+                    const std::optional<uintptr_t> pointer = state.reader.Read<uintptr_t>(nativeGameObject + offset);
+                    if (!pointer || *pointer == 0)
+                    {
+                        continue;
+                    }
+
+                    if (FindIndexedNativeObject(state.transformIndex, *pointer))
+                    {
+                        considerTransformAccess(*pointer, sourceScore + 150, true, "native GameObject -> indexed Transform");
+                    }
+                }
+            };
+
+            const auto considerUnityCompanionPointer = [&](uintptr_t pointer, int sourceScore) {
+                if (pointer == 0)
+                {
+                    return;
+                }
+
+                if (FindIndexedNativeObject(state.transformIndex, pointer))
+                {
+                    considerTransformAccess(pointer, sourceScore + 160, true, "indexed native Transform");
+                }
+                if (const ManagedNativeObject* transform = FindIndexedManagedObject(state.transformIndex, pointer))
+                {
+                    considerTransformAccess(transform->nativePointer, sourceScore + 165, true, "indexed managed Transform");
+                }
+                if (FindIndexedNativeObject(state.gameObjectIndex, pointer))
+                {
+                    scanNativeGameObjectForTransform(pointer, sourceScore + 120);
+                }
+                if (const ManagedNativeObject* gameObject = FindIndexedManagedObject(state.gameObjectIndex, pointer))
+                {
+                    scanNativeGameObjectForTransform(gameObject->nativePointer, sourceScore + 125);
+                    scanManagedForTransformReference(gameObject->managedAddress, sourceScore + 100);
                 }
             };
 
             std::vector<uintptr_t> nativeBases;
             if (const std::optional<uintptr_t> nativePointer =
                 state.reader.Read<uintptr_t>(OffsetAddress(objectAddress, state.objectCachedPtrOffset));
-                nativePointer && IsLikelyUnityNativePointer(objectAddress, *nativePointer))
+                nativePointer && IsLikelyUnityNativeObjectPointer(state, objectAddress, *nativePointer))
             {
                 AddUniqueProbeBase(&nativeBases, *nativePointer);
             }
+
+            scanManagedForTransformReference(objectAddress, 80);
 
             if (state.objectPointerOffset != 0)
             {
@@ -992,7 +1921,7 @@ namespace Aegis::UnityExternal
                 {
                     if (const std::optional<uintptr_t> objectNativePointer =
                         state.reader.Read<uintptr_t>(OffsetAddress(*objectPointer, state.objectCachedPtrOffset));
-                        objectNativePointer && IsLikelyUnityNativePointer(objectAddress, *objectNativePointer))
+                        objectNativePointer && IsLikelyUnityNativeObjectPointer(state, objectAddress, *objectNativePointer))
                     {
                         AddUniqueProbeBase(&nativeBases, *objectNativePointer);
                     }
@@ -1002,15 +1931,18 @@ namespace Aegis::UnityExternal
             std::vector<uintptr_t> oneHopBases;
             for (uintptr_t base : nativeBases)
             {
-                considerTransformAccess(base, 45);
+                considerUnityCompanionPointer(base, 90);
+                considerTransformAccess(base, 45, false, "native object as TransformAccess fallback");
 
-                for (std::size_t pointerOffset = 0; pointerOffset <= 0x180; pointerOffset += sizeof(uintptr_t))
+                for (std::size_t pointerOffset = 0; pointerOffset <= companionScanBytes; pointerOffset += sizeof(uintptr_t))
                 {
                     const std::optional<uintptr_t> pointer = state.reader.Read<uintptr_t>(base + pointerOffset);
                     if (!pointer || *pointer == 0 || *pointer == base)
                     {
                         continue;
                     }
+
+                    considerUnityCompanionPointer(*pointer, 110);
 
                     if (!IsLikelyDynamicDataAddress(state, *pointer, sizeof(uintptr_t)) &&
                         !IsReadableProcessRange(state.reader.ProcessHandle(), *pointer, sizeof(uintptr_t)))
@@ -1031,6 +1963,46 @@ namespace Aegis::UnityExternal
                 }
             }
 
+            std::vector<uintptr_t> twoHopBases;
+            std::size_t inspectedOneHopBases = 0;
+            for (uintptr_t base : oneHopBases)
+            {
+                if (++inspectedOneHopBases > 32)
+                {
+                    break;
+                }
+
+                for (std::size_t pointerOffset = 0; pointerOffset <= companionScanBytes; pointerOffset += sizeof(uintptr_t))
+                {
+                    const std::optional<uintptr_t> pointer = state.reader.Read<uintptr_t>(base + pointerOffset);
+                    if (!pointer || *pointer == 0 || *pointer == base)
+                    {
+                        continue;
+                    }
+
+                    considerUnityCompanionPointer(*pointer, 130);
+                    considerTransformAccess(*pointer, 105, false, "two-hop TransformAccess fallback");
+
+                    if ((IsLikelyDynamicDataAddress(state, *pointer, sizeof(uintptr_t)) ||
+                        IsReadableProcessRange(state.reader.ProcessHandle(), *pointer, sizeof(uintptr_t))) &&
+                        AddUniqueProbeBase(&twoHopBases, *pointer) &&
+                        twoHopBases.size() >= 64)
+                    {
+                        break;
+                    }
+                }
+
+                if (twoHopBases.size() >= 64)
+                {
+                    break;
+                }
+            }
+
+            for (uintptr_t base : twoHopBases)
+            {
+                considerTransformAccess(base, 75, false, "two-hop native TransformAccess fallback");
+            }
+
             constexpr std::array<std::size_t, 28> kTransformPositionOffsets = {
                 0x90, 0xA0, 0xAC, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0,
                 0x100, 0x110, 0x120, 0x130, 0x140, 0x150, 0x160, 0x170,
@@ -1040,11 +2012,11 @@ namespace Aegis::UnityExternal
 
             for (uintptr_t base : oneHopBases)
             {
-                considerTransformAccess(base, 65);
+                considerTransformAccess(base, 65, false, "one-hop native TransformAccess fallback");
 
                 for (std::size_t offset : kTransformPositionOffsets)
                 {
-                    considerCandidate(base + offset, 42);
+                    considerCandidate(base + offset, 42, "one-hop common Vec3 offset");
                 }
             }
 
@@ -1052,17 +2024,30 @@ namespace Aegis::UnityExternal
             {
                 for (std::size_t offset = 0; offset <= 0x240; offset += alignof(float))
                 {
-                    considerCandidate(base + offset, 8);
+                    considerCandidate(base + offset, 8, "one-hop broad Vec3 scan");
                 }
             }
 
-            if (best.address == 0)
+            const ProbeCandidate& selected = bestTrustedTransform.address != 0 ? bestTrustedTransform : best;
+            if (selected.address == 0)
             {
                 return false;
             }
 
-            *position = best.position;
-            *positionAddress = best.address;
+            *position = selected.position;
+            *positionAddress = selected.address;
+            if (transformBase)
+            {
+                *transformBase = selected.transformBase;
+            }
+            if (positionFromTransform)
+            {
+                *positionFromTransform = selected.fromTransform;
+            }
+            if (positionRoute)
+            {
+                *positionRoute = selected.route;
+            }
             return true;
         }
 
@@ -1070,11 +2055,27 @@ namespace Aegis::UnityExternal
             const GuiState& state,
             uintptr_t objectAddress,
             Vec3* position,
-            uintptr_t* positionAddress)
+            uintptr_t* positionAddress,
+            uintptr_t* transformBase = nullptr,
+            bool* positionFromTransform = nullptr,
+            std::string* positionRoute = nullptr)
         {
             if (!position || !positionAddress || objectAddress == 0 || !state.reader.IsOpen())
             {
                 return false;
+            }
+
+            if (transformBase)
+            {
+                *transformBase = 0;
+            }
+            if (positionFromTransform)
+            {
+                *positionFromTransform = false;
+            }
+            if (positionRoute)
+            {
+                positionRoute->clear();
             }
 
             uintptr_t readAddress = 0;
@@ -1082,6 +2083,10 @@ namespace Aegis::UnityExternal
             {
             case 0:
                 readAddress = OffsetAddress(objectAddress, state.positionOffset);
+                if (positionRoute)
+                {
+                    *positionRoute = "object + Vec3 offset";
+                }
                 break;
             case 1:
             {
@@ -1092,6 +2097,10 @@ namespace Aegis::UnityExternal
                     return false;
                 }
                 readAddress = OffsetAddress(*pointer, state.positionOffset);
+                if (positionRoute)
+                {
+                    *positionRoute = "pointer field -> Vec3 offset";
+                }
                 break;
             }
             case 2:
@@ -1103,6 +2112,10 @@ namespace Aegis::UnityExternal
                     return false;
                 }
                 readAddress = OffsetAddress(*nativePointer, state.positionOffset);
+                if (positionRoute)
+                {
+                    *positionRoute = "m_CachedPtr -> native Vec3 offset";
+                }
                 break;
             }
             case 3:
@@ -1121,6 +2134,10 @@ namespace Aegis::UnityExternal
                     return false;
                 }
                 readAddress = OffsetAddress(*transformPointer, state.positionOffset);
+                if (positionRoute)
+                {
+                    *positionRoute = "m_CachedPtr -> transform ptr -> Vec3 offset";
+                }
                 break;
             }
             case 4:
@@ -1139,15 +2156,24 @@ namespace Aegis::UnityExternal
                     return false;
                 }
                 readAddress = OffsetAddress(*nativePointer, state.positionOffset);
+                if (positionRoute)
+                {
+                    *positionRoute = "reference field -> m_CachedPtr -> Vec3 offset";
+                }
                 break;
             }
             case 5:
-                return ProbeObjectCachePosition(state, objectAddress, position, positionAddress);
+                return ProbeObjectCachePosition(state, objectAddress, position, positionAddress, transformBase, positionFromTransform, positionRoute);
             default:
                 return false;
             }
 
-            return TryReadObjectPositionAt(state, readAddress, position, positionAddress);
+            const bool read = TryReadObjectPositionAt(state, readAddress, position, positionAddress);
+            if (!read && positionRoute)
+            {
+                positionRoute->clear();
+            }
+            return read;
         }
 
         bool RefreshObjectCacheEntryPosition(const GuiState& state, ObjectCacheEntry* entry)
@@ -1157,9 +2183,19 @@ namespace Aegis::UnityExternal
                 return false;
             }
 
-            entry->hasPosition = ReadObjectCachePosition(state, entry->address, &entry->position, &entry->positionAddress);
+            entry->hasPosition = ReadObjectCachePosition(
+                state,
+                entry->address,
+                &entry->position,
+                &entry->positionAddress,
+                &entry->transformBase,
+                &entry->positionFromTransform,
+                &entry->positionRoute);
             if (!entry->hasPosition)
             {
+                entry->transformBase = 0;
+                entry->positionFromTransform = false;
+                entry->positionRoute.clear();
                 return false;
             }
 
@@ -1168,19 +2204,50 @@ namespace Aegis::UnityExternal
             {
                 entry->hasPosition = false;
                 entry->positionAddress = 0;
+                entry->transformBase = 0;
+                entry->positionFromTransform = false;
+                entry->positionRoute.clear();
                 entry->position = {};
                 return false;
             }
 
-            if (IsAddressNear(entry->positionAddress, entry->address, 0x10000))
+            if (state.objectPositionMode == 5 &&
+                !entry->positionFromTransform &&
+                IsAddressNear(entry->positionAddress, entry->address, 0x10000))
             {
                 entry->hasPosition = false;
                 entry->positionAddress = 0;
+                entry->transformBase = 0;
+                entry->positionFromTransform = false;
+                entry->positionRoute.clear();
                 entry->position = {};
                 return false;
             }
 
             return true;
+        }
+
+        bool ObjectCacheHasSamePositionSource(const std::vector<ObjectCacheEntry>& entries, const ObjectCacheEntry& candidate)
+        {
+            if (!candidate.hasPosition)
+            {
+                return false;
+            }
+
+            return std::any_of(entries.begin(), entries.end(), [&candidate](const ObjectCacheEntry& existing) {
+                if (!existing.hasPosition)
+                {
+                    return false;
+                }
+                if (candidate.positionFromTransform &&
+                    candidate.transformBase != 0 &&
+                    existing.transformBase == candidate.transformBase)
+                {
+                    return true;
+                }
+                return candidate.positionAddress != 0 &&
+                    existing.positionAddress == candidate.positionAddress;
+            });
         }
 
         void RefreshObjectCacheLivePositions(GuiState* state)
@@ -1327,6 +2394,23 @@ namespace Aegis::UnityExternal
                 point.y <= screenSize.y;
         }
 
+        bool IsWeakAutoProbeRoute(const std::string& route)
+        {
+            return ContainsInsensitiveAscii(route, "one-hop common Vec3 offset") ||
+                ContainsInsensitiveAscii(route, "one-hop broad Vec3 scan") ||
+                ContainsInsensitiveAscii(route, "broad Vec3 scan");
+        }
+
+        bool CanUsePositionForVisuals(const GuiState& state, bool fromTransform, const std::string& route)
+        {
+            if (fromTransform || state.allowWeakAutoProbeVisuals)
+            {
+                return true;
+            }
+
+            return !IsWeakAutoProbeRoute(route);
+        }
+
         bool MatrixValuesLookPlausible(const std::array<float, 16>& matrix)
         {
             int nonZero = 0;
@@ -1400,7 +2484,9 @@ namespace Aegis::UnityExternal
                     RefreshObjectCacheEntryPosition(*state, &entry);
                 }
 
-                if (!entry.hasPosition || !IsPlausibleObjectPosition(*state, entry.position))
+                if (!entry.hasPosition ||
+                    !CanUsePositionForVisuals(*state, entry.positionFromTransform, entry.positionRoute) ||
+                    !IsPlausibleObjectPosition(*state, entry.position))
                 {
                     continue;
                 }
@@ -1700,11 +2786,152 @@ namespace Aegis::UnityExternal
             MatrixCandidate best;
             std::size_t scannedRegions = 0;
             std::size_t scannedMatrices = 0;
+            std::size_t cameraMatrixRanges = 0;
             bool timedOut = false;
+
+            const auto scoreMatrixAt = [&](uintptr_t candidateAddress, const std::array<float, 16>& matrix, int sourceBonus) {
+                if (candidateAddress < 0x10000000)
+                {
+                    return;
+                }
+
+                MatrixCandidate row = ScoreViewProjectionMatrix(
+                    candidateAddress,
+                    matrix,
+                    0,
+                    samples,
+                    screenSize,
+                    state->upAxis,
+                    state->entityHeight,
+                    state->entityPositionAnchor,
+                    state->entityHeadOffset,
+                    state->entityFeetOffset);
+                row.score += sourceBonus;
+                if (CandidateBeats(row, best))
+                {
+                    best = row;
+                }
+
+                MatrixCandidate column = ScoreViewProjectionMatrix(
+                    candidateAddress,
+                    matrix,
+                    1,
+                    samples,
+                    screenSize,
+                    state->upAxis,
+                    state->entityHeight,
+                    state->entityPositionAnchor,
+                    state->entityHeadOffset,
+                    state->entityFeetOffset);
+                column.score += sourceBonus;
+                if (CandidateBeats(column, best))
+                {
+                    best = column;
+                }
+            };
+
+            const auto scanBytesForMatrices = [&](uintptr_t chunkBase, const std::vector<std::uint8_t>& bytes, int sourceBonus) {
+                if (bytes.size() < sizeof(float) * 16)
+                {
+                    return;
+                }
+
+                for (std::size_t offset = 0; offset + sizeof(float) * 16 <= bytes.size(); offset += 16)
+                {
+                    std::array<float, 16> matrix{};
+                    std::memcpy(matrix.data(), bytes.data() + offset, sizeof(float) * matrix.size());
+                    if (!MatrixValuesLookPlausible(matrix))
+                    {
+                        continue;
+                    }
+
+                    ++scannedMatrices;
+                    scoreMatrixAt(chunkBase + offset, matrix, sourceBonus);
+                }
+            };
+
+            const auto scanReadableRangeForMatrices = [&](uintptr_t rangeBase, uintptr_t rangeEnd, int sourceBonus) {
+                if (rangeBase == 0 || rangeEnd <= rangeBase)
+                {
+                    return;
+                }
+
+                for (uintptr_t chunkBase = rangeBase; chunkBase < rangeEnd;)
+                {
+                    if (GetTickCount64() - start > static_cast<ULONGLONG>(scanBudgetMs))
+                    {
+                        timedOut = true;
+                        break;
+                    }
+
+                    const std::size_t chunkSize = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(kChunkSize, rangeEnd - chunkBase));
+                    const std::vector<std::uint8_t> bytes = state->reader.ReadBytes(chunkBase, chunkSize);
+                    scanBytesForMatrices(chunkBase, bytes, sourceBonus);
+
+                    const uintptr_t chunkEnd = chunkBase + chunkSize;
+                    if (chunkEnd >= rangeEnd)
+                    {
+                        break;
+                    }
+                    chunkBase = chunkEnd;
+                }
+            };
+
+            if (!state->cameraIndex.empty())
+            {
+                const std::size_t maxCameraScans = std::min<std::size_t>(state->cameraIndex.size(), 32);
+                for (std::size_t index = 0; index < maxCameraScans; ++index)
+                {
+                    if (GetTickCount64() - start > static_cast<ULONGLONG>(scanBudgetMs))
+                    {
+                        timedOut = true;
+                        break;
+                    }
+
+                    const std::array<uintptr_t, 2> cameraBases = {
+                        state->cameraIndex[index].nativePointer,
+                        state->cameraIndex[index].managedAddress
+                    };
+                    for (uintptr_t cameraBase : cameraBases)
+                    {
+                        if (cameraBase == 0)
+                        {
+                            continue;
+                        }
+
+                        MEMORY_BASIC_INFORMATION cameraMbi{};
+                        if (VirtualQueryEx(state->reader.ProcessHandle(), reinterpret_cast<LPCVOID>(cameraBase), &cameraMbi, sizeof(cameraMbi)) != sizeof(cameraMbi))
+                        {
+                            continue;
+                        }
+
+                        const uintptr_t regionBase = reinterpret_cast<uintptr_t>(cameraMbi.BaseAddress);
+                        const uintptr_t regionEnd = regionBase + cameraMbi.RegionSize;
+                        if (regionEnd <= regionBase ||
+                            cameraBase < regionBase ||
+                            cameraMbi.State != MEM_COMMIT ||
+                            !IsAllowedMemoryType(cameraMbi.Type, false) ||
+                            !IsReadableMemoryProtection(cameraMbi.Protect))
+                        {
+                            continue;
+                        }
+
+                        const uintptr_t scanBase = cameraBase;
+                        const uintptr_t scanEnd = std::min<uintptr_t>(regionEnd, cameraBase + 0x8000);
+                        if (scanEnd > scanBase)
+                        {
+                            ++cameraMatrixRanges;
+                            scanReadableRangeForMatrices(scanBase, scanEnd, 34);
+                        }
+                    }
+                }
+            }
 
             uintptr_t address = 0;
             MEMORY_BASIC_INFORMATION mbi{};
-            while (VirtualQueryEx(state->reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
+            while (!timedOut &&
+                VirtualQueryEx(state->reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
             {
                 const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
                 const uintptr_t next = base + mbi.RegionSize;
@@ -1713,80 +2940,12 @@ namespace Aegis::UnityExternal
                     break;
                 }
 
-                if (GetTickCount64() - start > static_cast<ULONGLONG>(scanBudgetMs))
-                {
-                    timedOut = true;
-                    break;
-                }
-
                 if (mbi.State == MEM_COMMIT &&
                     IsAllowedMemoryType(mbi.Type, false) &&
                     IsReadableMemoryProtection(mbi.Protect))
                 {
                     ++scannedRegions;
-                    for (uintptr_t chunkBase = base; chunkBase < next;)
-                    {
-                        const std::size_t chunkSize = static_cast<std::size_t>(std::min<std::uint64_t>(kChunkSize, next - chunkBase));
-                        const std::vector<std::uint8_t> bytes = state->reader.ReadBytes(chunkBase, chunkSize);
-                        if (bytes.size() >= sizeof(float) * 16)
-                        {
-                            for (std::size_t offset = 0; offset + sizeof(float) * 16 <= bytes.size(); offset += 16)
-                            {
-                                std::array<float, 16> matrix{};
-                                std::memcpy(matrix.data(), bytes.data() + offset, sizeof(float) * matrix.size());
-                                if (!MatrixValuesLookPlausible(matrix))
-                                {
-                                    continue;
-                                }
-
-                                ++scannedMatrices;
-                                const uintptr_t candidateAddress = chunkBase + offset;
-                                if (candidateAddress < 0x10000000)
-                                {
-                                    continue;
-                                }
-
-                                MatrixCandidate row = ScoreViewProjectionMatrix(
-                                    candidateAddress,
-                                    matrix,
-                                    0,
-                                    samples,
-                                    screenSize,
-                                    state->upAxis,
-                                    state->entityHeight,
-                                    state->entityPositionAnchor,
-                                    state->entityHeadOffset,
-                                    state->entityFeetOffset);
-                                if (CandidateBeats(row, best))
-                                {
-                                    best = row;
-                                }
-
-                                MatrixCandidate column = ScoreViewProjectionMatrix(
-                                    candidateAddress,
-                                    matrix,
-                                    1,
-                                    samples,
-                                    screenSize,
-                                    state->upAxis,
-                                    state->entityHeight,
-                                    state->entityPositionAnchor,
-                                    state->entityHeadOffset,
-                                    state->entityFeetOffset);
-                                if (CandidateBeats(column, best))
-                                {
-                                    best = column;
-                                }
-                            }
-                        }
-
-                        const uintptr_t chunkEnd = chunkBase + chunkSize;
-                        if (chunkEnd >= next)
-                        {
-                            break;
-                        }
-                        chunkBase = chunkEnd;
-                    }
+                    scanReadableRangeForMatrices(base, next, 0);
                 }
 
                 address = next;
@@ -1820,6 +2979,10 @@ namespace Aegis::UnityExternal
                     << ", points " << best.onScreenPoints << "/" << best.validPoints
                     << ", height " << best.goodHeightPoints
                     << ", samples " << samples.size() << ")";
+                if (cameraMatrixRanges > 0)
+                {
+                    stream << ", camera ranges " << cameraMatrixRanges;
+                }
                 if (timedOut)
                 {
                     stream << " before scan budget ended";
@@ -1859,6 +3022,7 @@ namespace Aegis::UnityExternal
                 << ", height " << best.goodHeightPoints
                 << ", samples " << samples.size()
                 << ", regions " << scannedRegions
+                << ", camera ranges " << cameraMatrixRanges
                 << ", plausible matrices " << scannedMatrices;
             if (timedOut)
             {
@@ -1896,7 +3060,8 @@ namespace Aegis::UnityExternal
                 state->espEntities.reserve(state->objectCache.size());
                 for (ObjectCacheEntry& cached : state->objectCache)
                 {
-                    if (!cached.hasPosition)
+                    if (!cached.hasPosition ||
+                        !CanUsePositionForVisuals(*state, cached.positionFromTransform, cached.positionRoute))
                     {
                         continue;
                     }
@@ -1917,7 +3082,8 @@ namespace Aegis::UnityExternal
                 state->espEntities.reserve(state->fastTargets.size());
                 for (const FastTrackedTarget& target : state->fastTargets)
                 {
-                    if (!target.hasPosition)
+                    if (!target.hasPosition ||
+                        !CanUsePositionForVisuals(*state, target.positionFromTransform, target.positionRoute))
                     {
                         continue;
                     }
@@ -1930,7 +3096,8 @@ namespace Aegis::UnityExternal
                     RefreshObjectCacheLivePositions(state);
                     for (ObjectCacheEntry& cached : state->objectCache)
                     {
-                        if (cached.hasPosition)
+                        if (cached.hasPosition &&
+                            CanUsePositionForVisuals(*state, cached.positionFromTransform, cached.positionRoute))
                         {
                             appendEntity(cached.address, cached.position);
                         }
@@ -2508,6 +3675,7 @@ namespace Aegis::UnityExternal
         }
 
         std::vector<std::string> ObjectCacheResolveLabels(
+            const GuiState& state,
             RuntimeBackend backend,
             const std::string& primaryLabel,
             const std::string& fallbackLabel,
@@ -2525,6 +3693,115 @@ namespace Aegis::UnityExternal
             {
                 AddUniqueLabel(&labels, "PlayerVisualController");
                 AddUniqueLabel(&labels, "FallGirlVisualController");
+            }
+
+            const bool wantsPlayerLike =
+                ContainsInsensitiveAscii(primaryLabel, "player") ||
+                ContainsInsensitiveAscii(primaryLabel, "character") ||
+                ContainsInsensitiveAscii(fallbackLabel, "player") ||
+                ContainsInsensitiveAscii(fallbackLabel, "character");
+            if (state.objectCacheUseMetadataFallbacks && wantsPlayerLike && state.methodMap)
+            {
+                struct RankedLabel
+                {
+                    std::string label;
+                    int score = 0;
+                    std::size_t methodCount = 0;
+                };
+
+                std::vector<RankedLabel> ranked;
+                for (const MethodMap::Entry& entry : state.methodMap->Entries())
+                {
+                    if (entry.className.empty())
+                    {
+                        continue;
+                    }
+
+                    const std::string image = ToLowerAscii(entry.imageName);
+                    const std::string klass = ToLowerAscii(entry.className);
+                    if (ContainsInsensitiveAscii(image, "unityengine") ||
+                        ContainsInsensitiveAscii(image, "system") ||
+                        ContainsInsensitiveAscii(image, "mscorlib") ||
+                        ContainsInsensitiveAscii(image, "netstandard") ||
+                        ContainsInsensitiveAscii(image, "rewired") ||
+                        ContainsInsensitiveAscii(image, "photon") ||
+                        ContainsInsensitiveAscii(image, "playfab") ||
+                        ContainsInsensitiveAscii(klass, "rewired.") ||
+                        ContainsInsensitiveAscii(klass, "photon") ||
+                        ContainsInsensitiveAscii(klass, "playfab") ||
+                        ContainsInsensitiveAscii(klass, "ui") ||
+                        ContainsInsensitiveAscii(klass, "camera"))
+                    {
+                        continue;
+                    }
+
+                    int score = ComponentMetadataPreferenceScore(entry.imageName, entry.className);
+                    if (ContainsInsensitiveAscii(klass, "player"))
+                    {
+                        score += 95;
+                    }
+                    if (ContainsInsensitiveAscii(klass, "character"))
+                    {
+                        score += 65;
+                    }
+                    if (ContainsInsensitiveAscii(klass, "controller"))
+                    {
+                        score += 45;
+                    }
+                    if (ContainsInsensitiveAscii(klass, "movement") ||
+                        ContainsInsensitiveAscii(klass, "motor"))
+                    {
+                        score += 30;
+                    }
+                    if (ContainsInsensitiveAscii(klass, "visual"))
+                    {
+                        score += 18;
+                    }
+                    if (!ContainsInsensitiveAscii(klass, "player") &&
+                        !ContainsInsensitiveAscii(klass, "character") &&
+                        !ContainsInsensitiveAscii(klass, "controller") &&
+                        !ContainsInsensitiveAscii(klass, "movement") &&
+                        !ContainsInsensitiveAscii(klass, "motor"))
+                    {
+                        continue;
+                    }
+
+                    auto existing = std::find_if(ranked.begin(), ranked.end(), [&entry](const RankedLabel& label) {
+                        return EqualsInsensitiveAscii(label.label, entry.className);
+                    });
+                    if (existing == ranked.end())
+                    {
+                        ranked.push_back(RankedLabel{ entry.className, score, 1 });
+                    }
+                    else
+                    {
+                        ++existing->methodCount;
+                        existing->score = std::max(existing->score, score);
+                    }
+                }
+
+                std::sort(ranked.begin(), ranked.end(), [](const RankedLabel& left, const RankedLabel& right) {
+                    if (left.score != right.score)
+                    {
+                        return left.score > right.score;
+                    }
+                    if (left.methodCount != right.methodCount)
+                    {
+                        return left.methodCount > right.methodCount;
+                    }
+                    return left.label < right.label;
+                });
+
+                std::size_t added = 0;
+                for (const RankedLabel& label : ranked)
+                {
+                    const std::size_t before = labels.size();
+                    AddUniqueLabel(&labels, label.label);
+                    if (labels.size() != before && ++added >= 3)
+                    {
+                        break;
+                    }
+                }
             }
 
             return labels;
@@ -2908,6 +4185,208 @@ namespace Aegis::UnityExternal
             }
         }
 
+        void ScanUnityObjectIndexes(GuiState* state, const std::vector<ObjectCacheTarget>& targets)
+        {
+            if (!state)
+            {
+                return;
+            }
+
+            state->transformIndex.clear();
+            state->gameObjectIndex.clear();
+            state->cameraIndex.clear();
+            state->unityObjectIndexStatus.clear();
+            if (!state->autoBuildUnityObjectIndex ||
+                targets.empty() ||
+                !state->reader.IsOpen() ||
+                !state->reader.ProcessHandle())
+            {
+                return;
+            }
+
+            std::vector<uintptr_t> targetPointers;
+            targetPointers.reserve(targets.size());
+            for (const ObjectCacheTarget& target : targets)
+            {
+                targetPointers.push_back(target.pointer);
+            }
+            targetPointers = SortedUniqueAddresses(std::move(targetPointers));
+            if (targetPointers.empty())
+            {
+                return;
+            }
+
+            const std::size_t maxResults = static_cast<std::size_t>(
+                std::clamp(state->unityObjectIndexMaxResults, 16, 65536));
+            const ULONGLONG scanStart = GetTickCount64();
+            const ULONGLONG scanBudget = static_cast<ULONGLONG>(
+                std::clamp(state->objectCacheScanMaxMs, 1000, 300000));
+            constexpr std::size_t kChunkSize = 1024 * 1024;
+            std::size_t scannedRegions = 0;
+            bool timedOut = false;
+
+            uintptr_t address = 0;
+            MEMORY_BASIC_INFORMATION mbi{};
+            while ((state->transformIndex.size() < maxResults ||
+                state->gameObjectIndex.size() < maxResults ||
+                state->cameraIndex.size() < maxResults) &&
+                VirtualQueryEx(state->reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
+            {
+                if (GetTickCount64() - scanStart > scanBudget)
+                {
+                    timedOut = true;
+                    break;
+                }
+
+                const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                const uintptr_t next = base + mbi.RegionSize;
+                if (next <= base)
+                {
+                    break;
+                }
+
+                if (mbi.State == MEM_COMMIT &&
+                    IsAllowedMemoryType(mbi.Type, false) &&
+                    IsReadableMemoryProtection(mbi.Protect))
+                {
+                    ++scannedRegions;
+                    for (uintptr_t chunkBase = base; chunkBase < next;)
+                    {
+                        if (GetTickCount64() - scanStart > scanBudget)
+                        {
+                            timedOut = true;
+                            break;
+                        }
+
+                        const std::size_t chunkSize = static_cast<std::size_t>(
+                            std::min<std::uint64_t>(kChunkSize, next - chunkBase));
+                        const std::vector<std::uint8_t> bytes = state->reader.ReadBytes(chunkBase, chunkSize);
+                        if (bytes.size() >= sizeof(uintptr_t))
+                        {
+                            for (std::size_t offset = 0; offset + sizeof(uintptr_t) <= bytes.size(); offset += sizeof(uintptr_t))
+                            {
+                                uintptr_t candidate = 0;
+                                std::memcpy(&candidate, bytes.data() + offset, sizeof(candidate));
+                                if (!std::binary_search(targetPointers.begin(), targetPointers.end(), candidate))
+                                {
+                                    continue;
+                                }
+
+                                const uintptr_t managedAddress = chunkBase + offset;
+                                if (managedAddress == candidate || IsAddressNear(managedAddress, candidate, 0x1000000))
+                                {
+                                    continue;
+                                }
+
+                                const std::optional<uintptr_t> nativePointer =
+                                    state->reader.Read<uintptr_t>(OffsetAddress(managedAddress, state->objectCachedPtrOffset));
+                                if (!nativePointer ||
+                                    !IsLikelyUnityNativeObjectPointer(*state, managedAddress, *nativePointer))
+                                {
+                                    continue;
+                                }
+
+                                const auto matchedTarget = std::find_if(targets.begin(), targets.end(), [candidate](const ObjectCacheTarget& target) {
+                                    return target.pointer == candidate;
+                                });
+                                if (matchedTarget == targets.end())
+                                {
+                                    continue;
+                                }
+
+                                const bool isTransform = ContainsInsensitiveAscii(matchedTarget->label, "Transform");
+                                const bool isGameObject = ContainsInsensitiveAscii(matchedTarget->label, "GameObject");
+                                const bool isCamera = ContainsInsensitiveAscii(matchedTarget->label, "Camera");
+                                ManagedNativeObject object;
+                                object.managedAddress = managedAddress;
+                                object.nativePointer = *nativePointer;
+                                object.matchedPointer = candidate;
+                                object.label = matchedTarget->label;
+                                object.source = matchedTarget->source;
+                                if (isTransform && state->transformIndex.size() < maxResults)
+                                {
+                                    AddUniqueManagedNativeObject(&state->transformIndex, std::move(object), maxResults);
+                                }
+                                else if (isGameObject && state->gameObjectIndex.size() < maxResults)
+                                {
+                                    AddUniqueManagedNativeObject(&state->gameObjectIndex, std::move(object), maxResults);
+                                }
+                                else if (isCamera && state->cameraIndex.size() < maxResults)
+                                {
+                                    AddUniqueManagedNativeObject(&state->cameraIndex, std::move(object), maxResults);
+                                }
+                            }
+                        }
+
+                        const uintptr_t chunkEnd = chunkBase + chunkSize;
+                        if (chunkEnd >= next)
+                        {
+                            break;
+                        }
+                        chunkBase = chunkEnd;
+                    }
+                }
+
+                if (timedOut)
+                {
+                    break;
+                }
+
+                address = next;
+            }
+
+            SortManagedNativeIndex(&state->transformIndex);
+            SortManagedNativeIndex(&state->gameObjectIndex);
+            SortManagedNativeIndex(&state->cameraIndex);
+
+            std::ostringstream status;
+            status << "Unity object index: " << state->transformIndex.size()
+                << " Transform wrapper(s), " << state->gameObjectIndex.size()
+                << " GameObject wrapper(s), " << state->cameraIndex.size()
+                << " Camera wrapper(s)";
+            if (timedOut)
+            {
+                status << " before " << scanBudget << " ms budget ended";
+            }
+            status << ", scanned " << scannedRegions << " readable region(s).";
+            state->unityObjectIndexStatus = status.str();
+            AddLog(state, "%s", state->unityObjectIndexStatus.c_str());
+        }
+
+        void RefreshUnityObjectIndex(GuiState* state)
+        {
+            if (!state || !state->process)
+            {
+                return;
+            }
+
+            state->transformIndex.clear();
+            state->gameObjectIndex.clear();
+            state->cameraIndex.clear();
+            state->unityObjectIndexStatus.clear();
+            if (!state->autoBuildUnityObjectIndex)
+            {
+                return;
+            }
+
+            const RuntimeBackend backend = state->process->modules.Backend();
+            std::vector<ObjectCacheTarget> targets;
+            if (backend == RuntimeBackend::IL2CPP)
+            {
+                AddIl2CppAutoClassTargets(state, &targets, "UnityEngine.Transform");
+                AddIl2CppAutoClassTargets(state, &targets, "UnityEngine.GameObject");
+                AddIl2CppAutoClassTargets(state, &targets, "UnityEngine.Camera");
+            }
+            else if (backend == RuntimeBackend::Mono)
+            {
+                AddMonoAutoVTableTargets(state, &targets, "UnityEngine.Transform");
+                AddMonoAutoVTableTargets(state, &targets, "UnityEngine.GameObject");
+                AddMonoAutoVTableTargets(state, &targets, "UnityEngine.Camera");
+            }
+
+            ScanUnityObjectIndexes(state, targets);
+        }
+
         void RefreshObjectCache(GuiState* state)
         {
             if (!state)
@@ -2919,12 +4398,16 @@ namespace Aegis::UnityExternal
             state->objectCachePositionsReadThisFrame = 0;
             state->objectCachePositionFailuresThisFrame = 0;
             state->objectCache.clear();
+            state->transformIndex.clear();
+            state->gameObjectIndex.clear();
+            state->cameraIndex.clear();
             state->fastTargets.clear();
             state->fastTargetsReadThisFrame = 0;
             state->fastTargetsFallbacksThisFrame = 0;
             state->fastTargetsHeldThisFrame = 0;
             state->fastTargetsFailedThisFrame = 0;
             state->objectCacheStatus.clear();
+            state->unityObjectIndexStatus.clear();
             state->viewProjectionAutoStatus.clear();
             state->viewProjectionLastAutoScanTick = 0;
 
@@ -2976,7 +4459,17 @@ namespace Aegis::UnityExternal
             }
 
             const std::vector<std::string> autoResolveLabels =
-                ObjectCacheResolveLabels(backend, primaryLabel, fallbackLabel, state->objectCacheUseFallback);
+                ObjectCacheResolveLabels(*state, backend, primaryLabel, fallbackLabel, state->objectCacheUseFallback);
+            if (!autoResolveLabels.empty())
+            {
+                std::ostringstream labelsStream;
+                labelsStream << "Object cache resolve labels:";
+                for (const std::string& label : autoResolveLabels)
+                {
+                    labelsStream << " " << label;
+                }
+                AddLog(state, "%s", labelsStream.str().c_str());
+            }
             if (backend == RuntimeBackend::IL2CPP)
             {
                 for (const std::string& label : autoResolveLabels)
@@ -3001,6 +4494,8 @@ namespace Aegis::UnityExternal
                 AddLog(state, "Object cache scan skipped: no component class/header pointer.");
                 return;
             }
+
+            RefreshUnityObjectIndex(state);
 
             const std::size_t maxResults = static_cast<std::size_t>(std::clamp(state->objectCacheMaxResults, 1, 4096));
             constexpr std::size_t kChunkSize = 1024 * 1024;
@@ -3082,8 +4577,7 @@ namespace Aegis::UnityExternal
                                     const std::optional<uintptr_t> nativePointer =
                                         state->reader.Read<uintptr_t>(OffsetAddress(chunkBase + offset, state->objectCachedPtrOffset));
                                     if (!nativePointer ||
-                                        !IsLikelyUnityNativePointer(chunkBase + offset, *nativePointer) ||
-                                        !IsReadableProcessRange(state->reader.ProcessHandle(), *nativePointer, sizeof(uintptr_t)))
+                                        !IsLikelyUnityNativeObjectPointer(*state, chunkBase + offset, *nativePointer))
                                     {
                                         continue;
                                     }
@@ -3095,6 +4589,10 @@ namespace Aegis::UnityExternal
                                 entry.label = matchedTarget->label;
                                 entry.source = matchedTarget->source;
                                 entry.hasPosition = RefreshObjectCacheEntryPosition(*state, &entry);
+                                if (ObjectCacheHasSamePositionSource(state->objectCache, entry))
+                                {
+                                    continue;
+                                }
                                 if (entry.hasPosition)
                                 {
                                     ++positionedCount;
@@ -3183,15 +4681,23 @@ namespace Aegis::UnityExternal
 
             if (const std::optional<uintptr_t> cachedPtr =
                 state.reader.Read<uintptr_t>(OffsetAddress(target->objectAddress, state.objectCachedPtrOffset));
-                cachedPtr && IsLikelyUnityNativePointer(target->objectAddress, *cachedPtr))
+                cachedPtr && IsLikelyUnityNativeObjectPointer(state, target->objectAddress, *cachedPtr))
             {
                 target->cachedPtr = *cachedPtr;
                 target->cachedPtrToPositionOffset = SignedAddressDelta(target->positionAddress, *cachedPtr);
             }
 
             std::ostringstream stream;
+            if (!target->positionRoute.empty())
+            {
+                stream << target->positionRoute << "; ";
+            }
             stream << "pos " << FormatHex(target->positionAddress)
                 << ", object" << FormatSignedHexOffset(target->objectToPositionOffset);
+            if (target->positionFromTransform && target->transformBase != 0)
+            {
+                stream << ", transform " << FormatHex(target->transformBase);
+            }
             if (target->cachedPtr != 0)
             {
                 stream << ", m_CachedPtr " << FormatHex(target->cachedPtr)
@@ -3210,6 +4716,25 @@ namespace Aegis::UnityExternal
             if (target.hasPosition)
             {
                 score += 30;
+            }
+
+            if (target.positionFromTransform && target.transformBase != 0)
+            {
+                score += 150;
+            }
+            else if (ContainsInsensitiveAscii(target.positionRoute, "broad Vec3 scan"))
+            {
+                score -= 55;
+            }
+            else if (ContainsInsensitiveAscii(target.positionRoute, "Vec3"))
+            {
+                score -= 18;
+            }
+
+            if (ContainsInsensitiveAscii(target.source, "internal exported profile") ||
+                ContainsInsensitiveAscii(target.positionRoute, "internal profile"))
+            {
+                score += 220;
             }
 
             if (target.positionShareCount <= 1)
@@ -3412,7 +4937,9 @@ namespace Aegis::UnityExternal
 
             for (const ObjectCacheEntry& entry : state->objectCache)
             {
-                if (!entry.hasPosition || entry.positionAddress == 0)
+                if (!entry.hasPosition ||
+                    entry.positionAddress == 0 ||
+                    !CanUsePositionForVisuals(*state, entry.positionFromTransform, entry.positionRoute))
                 {
                     continue;
                 }
@@ -3421,10 +4948,13 @@ namespace Aegis::UnityExternal
                 target.objectAddress = entry.address;
                 target.matchedPointer = entry.matchedPointer;
                 target.positionAddress = entry.positionAddress;
+                target.transformBase = entry.transformBase;
                 target.position = entry.position;
                 target.lastGoodPosition = entry.position;
                 target.hasPosition = true;
                 target.hasLastGoodPosition = true;
+                target.positionFromTransform = entry.positionFromTransform;
+                target.positionRoute = entry.positionRoute;
                 target.lastGoodReadTick = GetTickCount64();
                 target.positionShareCount = std::max<std::size_t>(positionShareCount(entry.positionAddress), 1);
                 target.label = entry.label;
@@ -3456,8 +4986,11 @@ namespace Aegis::UnityExternal
             target->objectAddress = entry.address;
             target->matchedPointer = entry.matchedPointer;
             target->positionAddress = entry.positionAddress;
+            target->transformBase = entry.transformBase;
             target->position = entry.position;
             target->hasPosition = entry.hasPosition;
+            target->positionFromTransform = entry.positionFromTransform;
+            target->positionRoute = entry.positionRoute;
             if (entry.hasPosition)
             {
                 target->lastGoodPosition = entry.position;
@@ -3518,6 +5051,25 @@ namespace Aegis::UnityExternal
             {
                 const std::optional<uintptr_t> header = state->reader.Read<uintptr_t>(target->objectAddress);
                 objectHeaderMatches = header && *header == target->matchedPointer;
+            }
+
+            if (objectHeaderMatches &&
+                target->positionFromTransform &&
+                target->transformBase != 0)
+            {
+                Vec3 transformPosition{};
+                uintptr_t transformPositionAddress = 0;
+                if (ReadTransformAccessWorldPosition(*state, target->transformBase, &transformPosition, &transformPositionAddress))
+                {
+                    target->position = transformPosition;
+                    target->positionAddress = transformPositionAddress;
+                    target->hasPosition = true;
+                    target->lastGoodPosition = transformPosition;
+                    target->hasLastGoodPosition = true;
+                    target->lastGoodReadTick = now;
+                    target->staleReads = 0;
+                    return FastTargetReadResult::Direct;
+                }
             }
 
             const auto absOffset = [](std::int64_t value) -> std::uint64_t {
@@ -5358,6 +6910,7 @@ namespace Aegis::UnityExternal
                 "Auto probe object/native Vec3"
             };
             ImGui::Combo("Object Cache Position Mode", &state->objectPositionMode, positionModes, IM_ARRAYSIZE(positionModes));
+            ImGui::Checkbox("Draw Weak Auto-Probe Vec3", &state->allowWeakAutoProbeVisuals);
             ImGui::InputInt("Object Pointer Offset", &state->objectPointerOffset);
             ImGui::InputInt("m_CachedPtr Offset", &state->objectCachedPtrOffset);
             ImGui::InputInt("Transform Pointer Offset", &state->objectTransformPointerOffset);
@@ -5766,6 +7319,12 @@ namespace Aegis::UnityExternal
 
             ImGui::Text("Runtime Object Cache");
             ImGui::TextWrapped("Mono scans for object/vtable pointers and can try to discover MonoVTables by readable class-name metadata. IL2CPP scans for Il2CppClass/header pointers.");
+            if (ImGui::Button("Load Internal Profile"))
+            {
+                LoadInternalExternalProfile(state);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", WideToUtf8(SharedExternalProfilePath().wstring()).c_str());
             ImGui::InputTextWithHint("Primary Component##ObjectCacheComponent", "UnityEngine.Rigidbody", state->objectCacheComponentName, sizeof(state->objectCacheComponentName));
             ImGui::InputTextWithHint("Primary VTable/Class Pointer##ObjectCachePointer", "0x00000000", state->objectCachePointer, sizeof(state->objectCachePointer));
             ImGui::InputTextWithHint("Fallback Component##ObjectCacheFallbackComponent", "UnityEngine.Rigidbody", state->objectCacheFallbackComponentName, sizeof(state->objectCacheFallbackComponentName));
@@ -5774,8 +7333,12 @@ namespace Aegis::UnityExternal
             ImGui::Checkbox("Require Readable m_CachedPtr", &state->objectCacheRequireCachedPtr);
             ImGui::Checkbox("Auto Resolve Mono VTables", &state->objectCacheAutoResolveMono);
             ImGui::Checkbox("Auto Resolve IL2CPP Class Pointers", &state->objectCacheAutoResolveIl2Cpp);
+            ImGui::Checkbox("Deep Metadata Fallback Labels", &state->objectCacheUseMetadataFallbacks);
             ImGui::InputInt("Class Scan Budget MS", &state->classScanMaxMs);
             ImGui::InputInt("Object Cache Scan MS", &state->objectCacheScanMaxMs);
+            ImGui::Checkbox("Build Unity Transform/GameObject Index", &state->autoBuildUnityObjectIndex);
+            ImGui::InputInt("Unity Index Max Results", &state->unityObjectIndexMaxResults);
+            ImGui::InputInt("Companion Scan Bytes", &state->nativeCompanionScanBytes);
             ImGui::Checkbox("Auto Rebuild Cache", &state->objectCacheAutoRebuild);
             ImGui::SameLine();
             ImGui::InputInt("Rebuild Interval MS", &state->objectCacheAutoRebuildMs);
@@ -5783,6 +7346,7 @@ namespace Aegis::UnityExternal
             ImGui::SameLine();
             ImGui::Checkbox("Fast Targets Cache Fallback", &state->fastTargetsFallbackToCache);
             ImGui::Checkbox("Smooth Fast Targets", &state->fastTargetsUseLastGood);
+            ImGui::Checkbox("Allow Weak Auto-Probe Visuals", &state->allowWeakAutoProbeVisuals);
             ImGui::InputInt("Fast Hold Last Good MS", &state->fastTargetLastGoodMs);
             ImGui::InputInt("Fast Fallback Probe MS", &state->fastTargetFallbackProbeMs);
             ImGui::InputInt("Max Fast Targets", &state->maxFastTargets);
@@ -5828,6 +7392,10 @@ namespace Aegis::UnityExternal
             if (!state->objectCacheStatus.empty())
             {
                 ImGui::TextWrapped("%s", state->objectCacheStatus.c_str());
+            }
+            if (!state->unityObjectIndexStatus.empty())
+            {
+                ImGui::TextWrapped("%s", state->unityObjectIndexStatus.c_str());
             }
             ImGui::Text(
                 "Live position reads: %zu ok / %zu failed",
@@ -5887,12 +7455,13 @@ namespace Aegis::UnityExternal
                 }
                 ImGui::EndTable();
             }
-            if (ImGui::BeginTable("##ObjectCacheTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 140)))
+            if (ImGui::BeginTable("##ObjectCacheTable", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, ImVec2(0, 140)))
             {
                 ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                 ImGui::TableSetupColumn("Object", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Matched Pointer", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn("Route", ImGuiTableColumnFlags_WidthFixed, 180.0f);
                 ImGui::TableSetupColumn("Position");
                 ImGui::TableSetupColumn("Position Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 80.0f);
@@ -5911,9 +7480,9 @@ namespace Aegis::UnityExternal
                     ImGui::TableSetColumnIndex(3);
                     ImGui::TextUnformatted(entry.source.c_str());
                     ImGui::TableSetColumnIndex(4);
-                    if (entry.hasPosition)
+                    if (!entry.positionRoute.empty())
                     {
-                        ImGui::Text("%.2f, %.2f, %.2f", entry.position.x, entry.position.y, entry.position.z);
+                        ImGui::TextUnformatted(entry.positionRoute.c_str());
                     }
                     else
                     {
@@ -5922,13 +7491,22 @@ namespace Aegis::UnityExternal
                     ImGui::TableSetColumnIndex(5);
                     if (entry.hasPosition)
                     {
-                        ImGui::TextUnformatted(FormatHex(entry.positionAddress).c_str());
+                        ImGui::Text("%.2f, %.2f, %.2f", entry.position.x, entry.position.y, entry.position.z);
                     }
                     else
                     {
                         ImGui::TextDisabled("n/a");
                     }
                     ImGui::TableSetColumnIndex(6);
+                    if (entry.hasPosition)
+                    {
+                        ImGui::TextUnformatted(FormatHex(entry.positionAddress).c_str());
+                    }
+                    else
+                    {
+                        ImGui::TextDisabled("n/a");
+                    }
+                    ImGui::TableSetColumnIndex(7);
                     if (ImGui::SmallButton("Use"))
                     {
                         const std::string address = FormatHex(entry.address);
@@ -6215,12 +7793,80 @@ namespace Aegis::UnityExternal
         const ImVec2 targetSize = TargetClientSizeOrDefault(state, ImVec2(1920.0f, 1080.0f));
         TryAutoConfigureViewProjectionMatrix(&state, targetSize, true, 12000);
 
+        std::size_t transformSampleCount = 0;
+        Vec3 firstTransformSample{};
+        uintptr_t firstTransformBase = 0;
+        uintptr_t firstTransformPositionAddress = 0;
+        const std::size_t transformProbeLimit = std::min<std::size_t>(state.transformIndex.size(), 128);
+        for (std::size_t index = 0; index < transformProbeLimit; ++index)
+        {
+            Vec3 sample{};
+            uintptr_t sampleAddress = 0;
+            if (ReadTransformAccessWorldPosition(state, state.transformIndex[index].nativePointer, &sample, &sampleAddress))
+            {
+                if (transformSampleCount == 0)
+                {
+                    firstTransformSample = sample;
+                    firstTransformBase = state.transformIndex[index].nativePointer;
+                    firstTransformPositionAddress = sampleAddress;
+                }
+                ++transformSampleCount;
+            }
+        }
+
         std::wcout
             << L"\nObject cache diagnostic\n"
             << L"Target: " << state.process->executable << L" [pid " << state.process->pid << L"]\n"
             << L"Runtime: " << RuntimeBackendName(state.process->modules.Backend()) << L"\n"
             << L"Status: " << Utf8ToWide(state.objectCacheStatus) << L"\n"
+            << L"Unity Index: " << Utf8ToWide(state.unityObjectIndexStatus) << L"\n"
+            << L"Transform Samples: " << transformSampleCount << L"/" << transformProbeLimit;
+        if (transformSampleCount > 0)
+        {
+            std::wcout
+                << L" first=" << Utf8ToWide(FormatHex(firstTransformBase))
+                << L" pos=(" << firstTransformSample.x
+                << L", " << firstTransformSample.y
+                << L", " << firstTransformSample.z
+                << L") @ " << Utf8ToWide(FormatHex(firstTransformPositionAddress));
+        }
+        std::wcout
+            << L"\n"
             << L"Matrix: " << Utf8ToWide(state.viewProjectionAutoStatus) << L"\n";
+        const std::size_t transformDebugShown = std::min<std::size_t>(state.transformIndex.size(), 3);
+        for (std::size_t index = 0; index < transformDebugShown; ++index)
+        {
+            const ManagedNativeObject& transform = state.transformIndex[index];
+            const auto ptr10 = state.reader.Read<uintptr_t>(OffsetAddress(transform.nativePointer, 0x10));
+            const auto ptr38 = state.reader.Read<uintptr_t>(OffsetAddress(transform.nativePointer, 0x38));
+            const auto idx40 = state.reader.Read<int>(OffsetAddress(transform.nativePointer, 0x40));
+            std::optional<uintptr_t> matrixList;
+            std::optional<uintptr_t> parentList;
+            if (ptr38)
+            {
+                matrixList = state.reader.Read<uintptr_t>(OffsetAddress(*ptr38, 0x18));
+                parentList = state.reader.Read<uintptr_t>(OffsetAddress(*ptr38, 0x20));
+            }
+            std::wcout
+                << L"  transform-index[" << index << L"] managed="
+                << Utf8ToWide(FormatHex(transform.managedAddress))
+                << L" native=" << Utf8ToWide(FormatHex(transform.nativePointer))
+                << L" native+10=" << Utf8ToWide(ptr10 ? FormatHex(*ptr10) : std::string("n/a"))
+                << L" native+38=" << Utf8ToWide(ptr38 ? FormatHex(*ptr38) : std::string("n/a"))
+                << L" native+40=";
+            if (idx40)
+            {
+                std::wcout << *idx40;
+            }
+            else
+            {
+                std::wcout << L"n/a";
+            }
+            std::wcout
+                << L" matrices=" << Utf8ToWide(matrixList ? FormatHex(*matrixList) : std::string("n/a"))
+                << L" parents=" << Utf8ToWide(parentList ? FormatHex(*parentList) : std::string("n/a"));
+            std::wcout << L"\n";
+        }
         if (state.viewProjectionAddress[0])
         {
             std::wcout
@@ -6239,6 +7885,8 @@ namespace Aegis::UnityExternal
                 << L" score=" << targetEntry.score
                 << L" object=" << Utf8ToWide(FormatHex(targetEntry.objectAddress))
                 << L" pos@" << Utf8ToWide(FormatHex(targetEntry.positionAddress))
+                << (targetEntry.positionFromTransform ? L" transform-backed" : L" direct-vec3")
+                << L" route=" << Utf8ToWide(targetEntry.positionRoute.empty() ? std::string("n/a") : targetEntry.positionRoute)
                 << L" offsets=" << Utf8ToWide(targetEntry.offsetSummary)
                 << L"\n";
         }
@@ -6263,7 +7911,13 @@ namespace Aegis::UnityExternal
                     << L" pos=(" << entry.position.x
                     << L", " << entry.position.y
                     << L", " << entry.position.z
-                    << L") @ " << Utf8ToWide(FormatHex(entry.positionAddress));
+                    << L") @ " << Utf8ToWide(FormatHex(entry.positionAddress))
+                    << (entry.positionFromTransform ? L" transform-backed" : L" direct-vec3")
+                    << L" route=" << Utf8ToWide(entry.positionRoute.empty() ? std::string("n/a") : entry.positionRoute);
+                if (entry.transformBase != 0)
+                {
+                    std::wcout << L" transform=" << Utf8ToWide(FormatHex(entry.transformBase));
+                }
             }
             else
             {
