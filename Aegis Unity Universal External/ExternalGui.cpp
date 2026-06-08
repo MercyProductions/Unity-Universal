@@ -193,6 +193,8 @@ namespace Aegis::UnityExternal
             bool objectCacheAutoResolveMono = true;
             bool objectCacheAutoResolveIl2Cpp = true;
             bool objectCacheRequireCachedPtr = true;
+            int classScanMaxMs = 12000;
+            int objectCacheScanMaxMs = 20000;
             int monoClassNameOffset = 0x30;
             int monoClassNamespaceOffset = 0x38;
             int monoVTableClassOffset = 0;
@@ -233,6 +235,9 @@ namespace Aegis::UnityExternal
             int matrixLayout = 0;
             int upAxis = 0;
             float entityHeight = 1.8f;
+            int entityPositionAnchor = 0;
+            float entityHeadOffset = 1.0f;
+            float entityFeetOffset = 1.0f;
             char localPositionAddress[80] = "";
             float radarRange = 100.0f;
             float radarSize = 160.0f;
@@ -274,6 +279,14 @@ namespace Aegis::UnityExternal
 
         bool IsAllowedMemoryType(DWORD type, bool includeImages);
         bool IsReadableMemoryProtection(DWORD protect);
+        bool IsReadableProcessRange(HANDLE process, uintptr_t address, std::size_t size);
+        void AddUniqueLabel(std::vector<std::string>* labels, std::string label);
+        bool ReadMatrix4x4(const ExternalMemoryReader& reader, const std::string& addressText, std::array<float, 16>* matrix);
+        bool WorldToScreen(const Vec3& position, const std::array<float, 16>& matrix, int layout, const ImVec2& screenSize, ImVec2* out);
+        Vec3 EntityFeetFromPosition(const GuiState& state, const Vec3& position);
+        Vec3 EntityHeadFromPosition(const GuiState& state, const Vec3& position);
+        bool IsNearScreen(const ImVec2& point, const ImVec2& screenSize, float marginScale);
+        bool IsOnScreen(const ImVec2& point, const ImVec2& screenSize);
         void RebuildFastTargetsFromObjectCache(GuiState* state, bool logResult);
         void RefreshFastTargetLivePositions(GuiState* state);
         void RescoreFastTargets(GuiState* state);
@@ -646,6 +659,35 @@ namespace Aegis::UnityExternal
                 std::abs(value.z) <= maxAbs;
         }
 
+        bool IsLikelyDynamicDataAddress(const GuiState& state, uintptr_t address, std::size_t size)
+        {
+            if (!state.reader.ProcessHandle() || address == 0 || size == 0)
+            {
+                return false;
+            }
+
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQueryEx(state.reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) != sizeof(mbi))
+            {
+                return false;
+            }
+
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            const uintptr_t end = address + size;
+            if (end <= address || address < base || end > base + mbi.RegionSize)
+            {
+                return false;
+            }
+
+            const DWORD baseProtect = mbi.Protect & 0xFF;
+            return mbi.State == MEM_COMMIT &&
+                IsAllowedMemoryType(mbi.Type, false) &&
+                IsReadableMemoryProtection(mbi.Protect) &&
+                baseProtect != PAGE_EXECUTE_READ &&
+                baseProtect != PAGE_EXECUTE_READWRITE &&
+                baseProtect != PAGE_EXECUTE_WRITECOPY;
+        }
+
         bool TryReadObjectPositionAt(
             const GuiState& state,
             uintptr_t readAddress,
@@ -658,7 +700,8 @@ namespace Aegis::UnityExternal
             }
 
             Vec3 value{};
-            if (!ReadVec3(state.reader, readAddress, &value) ||
+            if (!IsLikelyDynamicDataAddress(state, readAddress, sizeof(Vec3)) ||
+                !ReadVec3(state.reader, readAddress, &value) ||
                 !IsPlausibleObjectPosition(state, value))
             {
                 return false;
@@ -727,6 +770,212 @@ namespace Aegis::UnityExternal
                 return false;
             }
 
+            struct ProbeCandidate
+            {
+                Vec3 position{};
+                uintptr_t address = 0;
+                int score = std::numeric_limits<int>::min();
+            };
+
+            std::array<float, 16> viewProjection{};
+            const bool hasViewProjection = ReadMatrix4x4(state.reader, state.viewProjectionAddress, &viewProjection);
+            const ImVec2 screenSize =
+                ImGui::GetCurrentContext()
+                ? ImGui::GetIO().DisplaySize
+                : ImVec2(1920.0f, 1080.0f);
+            ProbeCandidate best;
+
+            const auto scorePositionValue = [&](const Vec3& value, uintptr_t readAddress, int sourceScore) -> int {
+                int score = sourceScore;
+
+                const float horizontalMagnitude =
+                    state.upAxis == 1
+                    ? std::sqrt(value.x * value.x + value.y * value.y)
+                    : std::sqrt(value.x * value.x + value.z * value.z);
+                const float vertical =
+                    state.upAxis == 1
+                    ? value.z
+                    : value.y;
+
+                if (std::isfinite(horizontalMagnitude))
+                {
+                    if (horizontalMagnitude >= 0.05f && horizontalMagnitude <= 5000.0f)
+                    {
+                        score += 18;
+                    }
+                    else if (horizontalMagnitude < 0.05f)
+                    {
+                        score -= 20;
+                    }
+                }
+
+                if (std::isfinite(vertical) && vertical >= -20.0f && vertical <= 200.0f)
+                {
+                    score += 12;
+                }
+
+                int nearZeroComponents = 0;
+                nearZeroComponents += std::abs(value.x) < 0.0001f ? 1 : 0;
+                nearZeroComponents += std::abs(value.y) < 0.0001f ? 1 : 0;
+                nearZeroComponents += std::abs(value.z) < 0.0001f ? 1 : 0;
+                if (nearZeroComponents >= 2)
+                {
+                    score -= 14;
+                }
+
+                if (readAddress < 0x10000000)
+                {
+                    score -= 25;
+                }
+
+                if (hasViewProjection && screenSize.x > 1.0f && screenSize.y > 1.0f)
+                {
+                    ImVec2 feet{};
+                    ImVec2 head{};
+                    if (WorldToScreen(EntityFeetFromPosition(state, value), viewProjection, state.matrixLayout, screenSize, &feet) &&
+                        WorldToScreen(EntityHeadFromPosition(state, value), viewProjection, state.matrixLayout, screenSize, &head))
+                    {
+                        score += 18;
+                        const bool feetOnScreen = IsOnScreen(feet, screenSize);
+                        const bool headOnScreen = IsOnScreen(head, screenSize);
+                        const bool feetNear = IsNearScreen(feet, screenSize, 0.25f);
+                        const bool headNear = IsNearScreen(head, screenSize, 0.25f);
+                        if (feetOnScreen || headOnScreen)
+                        {
+                            score += 42;
+                        }
+                        else if (feetNear || headNear)
+                        {
+                            score += 18;
+                        }
+
+                        const float height = std::abs(feet.y - head.y);
+                        if (height >= 8.0f && height <= screenSize.y * 0.8f)
+                        {
+                            score += 28;
+                        }
+                        else if (height > screenSize.y * 1.5f)
+                        {
+                            score -= 18;
+                        }
+                    }
+                }
+
+                return score;
+            };
+
+            const auto considerCandidate = [&](uintptr_t readAddress, int sourceScore) {
+                Vec3 value{};
+                uintptr_t confirmedAddress = 0;
+                if (!TryReadObjectPositionAt(state, readAddress, &value, &confirmedAddress))
+                {
+                    return;
+                }
+
+                const int score = scorePositionValue(value, confirmedAddress, sourceScore);
+                if (score > best.score)
+                {
+                    best = ProbeCandidate{ value, confirmedAddress, score };
+                }
+            };
+
+            const auto readTransformAccessCandidate = [&](uintptr_t transformBase, std::size_t translationOffset, Vec3* out, uintptr_t* valueAddress) -> bool {
+                if (!out || !valueAddress || transformBase == 0)
+                {
+                    return false;
+                }
+
+                const std::optional<uintptr_t> transformData =
+                    state.reader.Read<uintptr_t>(OffsetAddress(transformBase, 0x38));
+                const std::optional<int> transformIndex =
+                    state.reader.Read<int>(OffsetAddress(transformBase, 0x40));
+                if (!transformData || *transformData == 0 ||
+                    !transformIndex || *transformIndex < 0 || *transformIndex > 0x200000 ||
+                    !IsReadableProcessRange(state.reader.ProcessHandle(), *transformData, sizeof(uintptr_t) * 4))
+                {
+                    return false;
+                }
+
+                const std::optional<uintptr_t> matrixList =
+                    state.reader.Read<uintptr_t>(OffsetAddress(*transformData, 0x18));
+                const std::optional<uintptr_t> parentIndexList =
+                    state.reader.Read<uintptr_t>(OffsetAddress(*transformData, 0x20));
+                if (!matrixList || *matrixList == 0 ||
+                    !parentIndexList || *parentIndexList == 0)
+                {
+                    return false;
+                }
+
+                constexpr uintptr_t kMatrixStride = 0x30;
+                Vec3 accumulated{};
+                uintptr_t matrixAddress =
+                    *matrixList + static_cast<uintptr_t>(*transformIndex) * kMatrixStride + translationOffset;
+                if (!IsLikelyDynamicDataAddress(state, matrixAddress, sizeof(Vec3)) ||
+                    !ReadVec3(state.reader, matrixAddress, &accumulated) ||
+                    !IsPlausibleObjectPosition(state, accumulated))
+                {
+                    return false;
+                }
+
+                int currentIndex = *transformIndex;
+                for (int depth = 0; depth < 64; ++depth)
+                {
+                    const std::optional<int> parentIndex =
+                        state.reader.Read<int>(*parentIndexList + static_cast<uintptr_t>(currentIndex) * sizeof(int));
+                    if (!parentIndex || *parentIndex < 0 || *parentIndex > 0x200000)
+                    {
+                        break;
+                    }
+
+                    Vec3 parentTranslation{};
+                    const uintptr_t parentAddress =
+                        *matrixList + static_cast<uintptr_t>(*parentIndex) * kMatrixStride + translationOffset;
+                    if (!IsLikelyDynamicDataAddress(state, parentAddress, sizeof(Vec3)) ||
+                        !ReadVec3(state.reader, parentAddress, &parentTranslation) ||
+                        !IsPlausibleObjectPosition(state, parentTranslation))
+                    {
+                        break;
+                    }
+
+                    accumulated.x += parentTranslation.x;
+                    accumulated.y += parentTranslation.y;
+                    accumulated.z += parentTranslation.z;
+                    currentIndex = *parentIndex;
+                    if (!IsPlausibleObjectPosition(state, accumulated))
+                    {
+                        break;
+                    }
+                }
+
+                if (!IsPlausibleObjectPosition(state, accumulated))
+                {
+                    return false;
+                }
+
+                *out = accumulated;
+                *valueAddress = matrixAddress;
+                return true;
+            };
+
+            const auto considerTransformAccess = [&](uintptr_t transformBase, int sourceScore) {
+                constexpr std::array<std::size_t, 4> kTranslationOffsets = { 0x0, 0x0C, 0x10, 0x20 };
+                for (std::size_t offset : kTranslationOffsets)
+                {
+                    Vec3 value{};
+                    uintptr_t valueAddress = 0;
+                    if (!readTransformAccessCandidate(transformBase, offset, &value, &valueAddress))
+                    {
+                        continue;
+                    }
+
+                    const int score = scorePositionValue(value, valueAddress, sourceScore + 75);
+                    if (score > best.score)
+                    {
+                        best = ProbeCandidate{ value, valueAddress, score };
+                    }
+                }
+            };
+
             std::vector<uintptr_t> nativeBases;
             if (const std::optional<uintptr_t> nativePointer =
                 state.reader.Read<uintptr_t>(OffsetAddress(objectAddress, state.objectCachedPtrOffset));
@@ -753,10 +1002,18 @@ namespace Aegis::UnityExternal
             std::vector<uintptr_t> oneHopBases;
             for (uintptr_t base : nativeBases)
             {
+                considerTransformAccess(base, 45);
+
                 for (std::size_t pointerOffset = 0; pointerOffset <= 0x180; pointerOffset += sizeof(uintptr_t))
                 {
                     const std::optional<uintptr_t> pointer = state.reader.Read<uintptr_t>(base + pointerOffset);
                     if (!pointer || *pointer == 0 || *pointer == base)
+                    {
+                        continue;
+                    }
+
+                    if (!IsLikelyDynamicDataAddress(state, *pointer, sizeof(uintptr_t)) &&
+                        !IsReadableProcessRange(state.reader.ProcessHandle(), *pointer, sizeof(uintptr_t)))
                     {
                         continue;
                     }
@@ -783,12 +1040,11 @@ namespace Aegis::UnityExternal
 
             for (uintptr_t base : oneHopBases)
             {
+                considerTransformAccess(base, 65);
+
                 for (std::size_t offset : kTransformPositionOffsets)
                 {
-                    if (TryReadObjectPositionAt(state, base + offset, position, positionAddress))
-                    {
-                        return true;
-                    }
+                    considerCandidate(base + offset, 42);
                 }
             }
 
@@ -796,14 +1052,18 @@ namespace Aegis::UnityExternal
             {
                 for (std::size_t offset = 0; offset <= 0x240; offset += alignof(float))
                 {
-                    if (TryReadObjectPositionAt(state, base + offset, position, positionAddress))
-                    {
-                        return true;
-                    }
+                    considerCandidate(base + offset, 8);
                 }
             }
 
-            return false;
+            if (best.address == 0)
+            {
+                return false;
+            }
+
+            *position = best.position;
+            *positionAddress = best.address;
+            return true;
         }
 
         bool ReadObjectCachePosition(
@@ -1016,6 +1276,39 @@ namespace Aegis::UnityExternal
             return head;
         }
 
+        Vec3 OffsetAlongUp(Vec3 value, int upAxis, float amount)
+        {
+            if (upAxis == 1)
+            {
+                value.z += amount;
+            }
+            else
+            {
+                value.y += amount;
+            }
+            return value;
+        }
+
+        Vec3 EntityFeetFromPosition(const GuiState& state, const Vec3& position)
+        {
+            if (state.entityPositionAnchor == 1)
+            {
+                return position;
+            }
+
+            return OffsetAlongUp(position, state.upAxis, -std::clamp(state.entityFeetOffset, -10.0f, 30.0f));
+        }
+
+        Vec3 EntityHeadFromPosition(const GuiState& state, const Vec3& position)
+        {
+            if (state.entityPositionAnchor == 1)
+            {
+                return EntityHeadPosition(position, state.upAxis, std::clamp(state.entityHeight, 0.1f, 30.0f));
+            }
+
+            return OffsetAlongUp(position, state.upAxis, std::clamp(state.entityHeadOffset, -10.0f, 30.0f));
+        }
+
         bool IsNearScreen(const ImVec2& point, const ImVec2& screenSize, float marginScale = 0.25f)
         {
             const float marginX = std::max(screenSize.x * marginScale, 64.0f);
@@ -1221,7 +1514,10 @@ namespace Aegis::UnityExternal
             const std::vector<Vec3>& samples,
             const ImVec2& screenSize,
             int upAxis,
-            float entityHeight)
+            float entityHeight,
+            int entityPositionAnchor,
+            float entityHeadOffset,
+            float entityFeetOffset)
         {
             MatrixCandidate candidate;
             candidate.address = address;
@@ -1243,10 +1539,17 @@ namespace Aegis::UnityExternal
 
             for (const Vec3& sample : samples)
             {
+                const Vec3 feetPosition = entityPositionAnchor == 1
+                    ? sample
+                    : OffsetAlongUp(sample, upAxis, -std::clamp(entityFeetOffset, -10.0f, 30.0f));
+                const Vec3 headPosition = entityPositionAnchor == 1
+                    ? EntityHeadPosition(sample, upAxis, std::clamp(entityHeight, 0.1f, 30.0f))
+                    : OffsetAlongUp(sample, upAxis, std::clamp(entityHeadOffset, -10.0f, 30.0f));
+
                 ImVec2 feet{};
                 ImVec2 head{};
-                if (!WorldToScreen(sample, matrix, layout, screenSize, &feet) ||
-                    !WorldToScreen(EntityHeadPosition(sample, upAxis, entityHeight), matrix, layout, screenSize, &head))
+                if (!WorldToScreen(feetPosition, matrix, layout, screenSize, &feet) ||
+                    !WorldToScreen(headPosition, matrix, layout, screenSize, &head))
                 {
                     continue;
                 }
@@ -1450,7 +1753,10 @@ namespace Aegis::UnityExternal
                                     samples,
                                     screenSize,
                                     state->upAxis,
-                                    state->entityHeight);
+                                    state->entityHeight,
+                                    state->entityPositionAnchor,
+                                    state->entityHeadOffset,
+                                    state->entityFeetOffset);
                                 if (CandidateBeats(row, best))
                                 {
                                     best = row;
@@ -1463,7 +1769,10 @@ namespace Aegis::UnityExternal
                                     samples,
                                     screenSize,
                                     state->upAxis,
-                                    state->entityHeight);
+                                    state->entityHeight,
+                                    state->entityPositionAnchor,
+                                    state->entityHeadOffset,
+                                    state->entityFeetOffset);
                                 if (CandidateBeats(column, best))
                                 {
                                     best = column;
@@ -1521,7 +1830,22 @@ namespace Aegis::UnityExternal
                 }
                 state->viewProjectionAutoStatus = stream.str();
                 AddLog(state, "%s", state->viewProjectionAutoStatus.c_str());
-                RescoreFastTargets(state);
+                if (!state->objectCache.empty())
+                {
+                    RefreshObjectCacheLivePositions(state);
+                    if (state->autoBuildFastTargets)
+                    {
+                        RebuildFastTargetsFromObjectCache(state, false);
+                    }
+                    else
+                    {
+                        RescoreFastTargets(state);
+                    }
+                }
+                else
+                {
+                    RescoreFastTargets(state);
+                }
                 return true;
             }
 
@@ -1555,11 +1879,13 @@ namespace Aegis::UnityExternal
 
             state->espEntities.clear();
             auto appendEntity = [&](uintptr_t address, const Vec3& position) {
+                const Vec3 feetPosition = EntityFeetFromPosition(*state, position);
+                const Vec3 headPosition = EntityHeadFromPosition(*state, position);
                 EspEntity entity;
                 entity.address = address;
                 entity.position = position;
-                entity.onScreen = WorldToScreen(position, matrix, state->matrixLayout, screenSize, &entity.screen);
-                entity.onScreen = WorldToScreen(EntityHeadPosition(position, state->upAxis, state->entityHeight), matrix, state->matrixLayout, screenSize, &entity.head)
+                entity.onScreen = WorldToScreen(feetPosition, matrix, state->matrixLayout, screenSize, &entity.screen);
+                entity.onScreen = WorldToScreen(headPosition, matrix, state->matrixLayout, screenSize, &entity.head)
                     && entity.onScreen;
                 state->espEntities.push_back(entity);
             };
@@ -1660,13 +1986,7 @@ namespace Aegis::UnityExternal
                     continue;
                 }
 
-                EspEntity entity;
-                entity.address = entityAddress;
-                entity.position = position;
-                entity.onScreen = WorldToScreen(position, matrix, state->matrixLayout, screenSize, &entity.screen);
-                entity.onScreen = WorldToScreen(EntityHeadPosition(position, state->upAxis, state->entityHeight), matrix, state->matrixLayout, screenSize, &entity.head)
-                    && entity.onScreen;
-                state->espEntities.push_back(entity);
+                appendEntity(entityAddress, position);
             }
 
             return true;
@@ -1688,16 +2008,85 @@ namespace Aegis::UnityExternal
                 baseProtect == PAGE_EXECUTE_WRITECOPY;
         }
 
-        std::string ComponentMetadataSummary(const GuiState& state, const std::string& componentName)
+        std::string ShortClassName(const std::string& className)
         {
-            if (!state.methodMap || componentName.empty())
+            const std::size_t separator = className.rfind('.');
+            return separator == std::string::npos ? className : className.substr(separator + 1);
+        }
+
+        int ComponentMetadataPreferenceScore(const std::string& imageName, const std::string& className)
+        {
+            int score = 0;
+            const std::string image = ToLowerAscii(imageName);
+            const std::string klass = ToLowerAscii(className);
+
+            if (image == "assembly-csharp")
             {
-                return {};
+                score += 250;
+            }
+            else if (image.rfind("assembly-csharp", 0) == 0)
+            {
+                score += 220;
+            }
+            else if (ContainsInsensitiveAscii(image, "assembly"))
+            {
+                score += 80;
             }
 
+            if (klass.find('.') == std::string::npos)
+            {
+                score += 30;
+            }
+
+            if (ContainsInsensitiveAscii(klass, "player"))
+            {
+                score += 20;
+            }
+            if (ContainsInsensitiveAscii(klass, "character"))
+            {
+                score += 12;
+            }
+
+            if (ContainsInsensitiveAscii(image, "rewired") ||
+                ContainsInsensitiveAscii(klass, "rewired."))
+            {
+                score -= 220;
+            }
+            if (ContainsInsensitiveAscii(image, "unityengine") ||
+                ContainsInsensitiveAscii(klass, "unityengine."))
+            {
+                score -= 120;
+            }
+            if (ContainsInsensitiveAscii(image, "system") ||
+                ContainsInsensitiveAscii(image, "mscorlib") ||
+                ContainsInsensitiveAscii(image, "netstandard") ||
+                ContainsInsensitiveAscii(klass, "system."))
+            {
+                score -= 100;
+            }
+
+            return score;
+        }
+
+        struct ComponentMetadataCandidate
+        {
+            std::string imageName;
+            std::string className;
             std::size_t methodCount = 0;
-            std::string firstImage;
-            std::string firstClass;
+            int score = 0;
+        };
+
+        std::vector<ComponentMetadataCandidate> ComponentMetadataCandidates(
+            const GuiState& state,
+            const std::string& componentName,
+            std::size_t maxCandidates)
+        {
+            std::vector<ComponentMetadataCandidate> candidates;
+            if (!state.methodMap || componentName.empty() || maxCandidates == 0)
+            {
+                return candidates;
+            }
+
             for (const MethodMap::Entry& entry : state.methodMap->Entries())
             {
                 if (!ClassNameMatches(entry.className, componentName))
@@ -1705,26 +2094,120 @@ namespace Aegis::UnityExternal
                     continue;
                 }
 
-                ++methodCount;
-                if (firstClass.empty())
+                auto existing = std::find_if(candidates.begin(), candidates.end(), [&entry](const ComponentMetadataCandidate& candidate) {
+                    return EqualsInsensitiveAscii(candidate.imageName, entry.imageName) &&
+                        EqualsInsensitiveAscii(candidate.className, entry.className);
+                });
+
+                if (existing == candidates.end())
                 {
-                    firstClass = entry.className;
-                    firstImage = entry.imageName;
+                    ComponentMetadataCandidate candidate;
+                    candidate.imageName = entry.imageName;
+                    candidate.className = entry.className;
+                    candidate.methodCount = 1;
+                    candidate.score = ComponentMetadataPreferenceScore(entry.imageName, entry.className);
+                    candidates.push_back(std::move(candidate));
+                }
+                else
+                {
+                    ++existing->methodCount;
                 }
             }
 
-            if (methodCount == 0)
+            std::sort(candidates.begin(), candidates.end(), [](const ComponentMetadataCandidate& left, const ComponentMetadataCandidate& right) {
+                if (left.score != right.score)
+                {
+                    return left.score > right.score;
+                }
+                if (left.methodCount != right.methodCount)
+                {
+                    return left.methodCount > right.methodCount;
+                }
+                if (left.imageName != right.imageName)
+                {
+                    return left.imageName < right.imageName;
+                }
+                return left.className < right.className;
+            });
+
+            if (candidates.size() > maxCandidates)
+            {
+                candidates.resize(maxCandidates);
+            }
+            return candidates;
+        }
+
+        std::vector<std::string> ComponentResolveLabelsFromMetadata(
+            const GuiState& state,
+            const std::string& requestedLabel,
+            std::size_t maxLabels,
+            std::string* detail)
+        {
+            std::vector<std::string> labels;
+            const std::string trimmed = TrimAscii(requestedLabel);
+            if (trimmed.empty())
+            {
+                return labels;
+            }
+
+            const bool requestedHasNamespace = trimmed.find('.') != std::string::npos;
+            if (requestedHasNamespace)
+            {
+                AddUniqueLabel(&labels, trimmed);
+                return labels;
+            }
+
+            const std::vector<ComponentMetadataCandidate> candidates =
+                ComponentMetadataCandidates(state, trimmed, maxLabels);
+            for (const ComponentMetadataCandidate& candidate : candidates)
+            {
+                AddUniqueLabel(&labels, candidate.className);
+            }
+            if (labels.empty())
+            {
+                AddUniqueLabel(&labels, trimmed);
+            }
+
+            if (detail && !candidates.empty())
+            {
+                std::ostringstream stream;
+                stream << "metadata candidates:";
+                const std::size_t shown = std::min<std::size_t>(candidates.size(), 5);
+                for (std::size_t index = 0; index < shown; ++index)
+                {
+                    const ComponentMetadataCandidate& candidate = candidates[index];
+                    stream << (index == 0 ? " " : ", ")
+                        << candidate.className
+                        << " in " << candidate.imageName
+                        << " score " << candidate.score;
+                }
+                *detail = stream.str();
+            }
+            return labels;
+        }
+
+        std::string ComponentMetadataSummary(const GuiState& state, const std::string& componentName)
+        {
+            if (!state.methodMap || componentName.empty())
+            {
+                return {};
+            }
+
+            const std::vector<ComponentMetadataCandidate> candidates =
+                ComponentMetadataCandidates(state, componentName, 1);
+            if (candidates.empty())
             {
                 return "metadata class not found";
             }
 
+            const ComponentMetadataCandidate& candidate = candidates.front();
             std::ostringstream stream;
-            stream << "metadata class " << firstClass;
-            if (!firstImage.empty())
+            stream << "metadata class " << candidate.className;
+            if (!candidate.imageName.empty())
             {
-                stream << " in " << firstImage;
+                stream << " in " << candidate.imageName;
             }
-            stream << " (" << methodCount << " methods)";
+            stream << " (" << candidate.methodCount << " methods, score " << candidate.score << ")";
             return stream.str();
         }
 
@@ -1851,11 +2334,18 @@ namespace Aegis::UnityExternal
 
             constexpr std::size_t kChunkSize = 1024 * 1024;
             const std::size_t overlap = std::min<std::size_t>(needle.size() > 0 ? needle.size() - 1 : 0, 4096);
+            const ULONGLONG start = GetTickCount64();
+            const ULONGLONG budget = static_cast<ULONGLONG>(std::clamp(state.classScanMaxMs, 1000, 120000));
             uintptr_t address = 0;
             MEMORY_BASIC_INFORMATION mbi{};
             while (results.size() < maxResults &&
                 VirtualQueryEx(state.reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
             {
+                if (GetTickCount64() - start > budget)
+                {
+                    break;
+                }
+
                 const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
                 const uintptr_t next = base + mbi.RegionSize;
                 if (next <= base)
@@ -1919,11 +2409,18 @@ namespace Aegis::UnityExternal
             }
 
             constexpr std::size_t kChunkSize = 1024 * 1024;
+            const ULONGLONG start = GetTickCount64();
+            const ULONGLONG budget = static_cast<ULONGLONG>(std::clamp(state.classScanMaxMs, 1000, 120000));
             uintptr_t address = 0;
             MEMORY_BASIC_INFORMATION mbi{};
             while (results.size() < maxResults &&
                 VirtualQueryEx(state.reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
             {
+                if (GetTickCount64() - start > budget)
+                {
+                    break;
+                }
+
                 const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
                 const uintptr_t next = base + mbi.RegionSize;
                 if (next <= base)
@@ -2073,10 +2570,6 @@ namespace Aegis::UnityExternal
             }
 
             std::vector<uintptr_t> namespaceStrings;
-            if (parts.hasNamespace)
-            {
-                namespaceStrings = FindAsciiStringAddresses(state, parts.namespaceName, 128);
-            }
 
             const std::vector<uintptr_t> nameReferences = FindPointerReferences(state, nameStrings, 512);
             for (uintptr_t reference : nameReferences)
@@ -2121,7 +2614,7 @@ namespace Aegis::UnityExternal
                                 continue;
                             }
 
-                            namespaceMatches = ContainsAddress(namespaceStrings, *namespacePointer) ||
+                            namespaceMatches =
                                 ReadAsciiCString(state.reader, *namespacePointer, 256) == parts.namespaceName;
                             if (namespaceMatches)
                             {
@@ -2239,18 +2732,29 @@ namespace Aegis::UnityExternal
                 return;
             }
 
-            std::string detail;
-            const std::vector<uintptr_t> classPointers = ResolveIl2CppClassPointersByName(*state, label, &detail);
-            AddLog(state, "IL2CPP class scan for %s: %s", label.c_str(), detail.c_str());
-
-            for (uintptr_t classPointer : classPointers)
+            std::string metadataDetail;
+            const std::vector<std::string> resolveLabels =
+                ComponentResolveLabelsFromMetadata(*state, label, 1, &metadataDetail);
+            if (!metadataDetail.empty())
             {
-                AddUniqueObjectCacheTarget(targets, ObjectCacheTarget{
-                    classPointer,
-                    label,
-                    ComponentMetadataSummary(*state, label),
-                    "il2cpp class-name scan"
-                });
+                AddLog(state, "IL2CPP metadata priority for %s: %s", label.c_str(), metadataDetail.c_str());
+            }
+
+            for (const std::string& resolveLabel : resolveLabels)
+            {
+                std::string detail;
+                const std::vector<uintptr_t> classPointers = ResolveIl2CppClassPointersByName(*state, resolveLabel, &detail);
+                AddLog(state, "IL2CPP class scan for %s: %s", resolveLabel.c_str(), detail.c_str());
+
+                for (uintptr_t classPointer : classPointers)
+                {
+                    AddUniqueObjectCacheTarget(targets, ObjectCacheTarget{
+                        classPointer,
+                        resolveLabel,
+                        ComponentMetadataSummary(*state, resolveLabel),
+                        "il2cpp class-name scan"
+                    });
+                }
             }
         }
 
@@ -2374,22 +2878,33 @@ namespace Aegis::UnityExternal
                 return;
             }
 
-            std::string classDetail;
-            const std::vector<uintptr_t> classPointers = ResolveMonoClassPointersByName(*state, label, &classDetail);
-            AddLog(state, "Mono class scan for %s: %s", label.c_str(), classDetail.c_str());
-
-            std::string vtableDetail;
-            const std::vector<uintptr_t> vtablePointers = ResolveMonoVTablePointersByClassPointers(*state, classPointers, &vtableDetail);
-            AddLog(state, "Mono vtable scan for %s: %s", label.c_str(), vtableDetail.c_str());
-
-            for (uintptr_t vtablePointer : vtablePointers)
+            std::string metadataDetail;
+            const std::vector<std::string> resolveLabels =
+                ComponentResolveLabelsFromMetadata(*state, label, 1, &metadataDetail);
+            if (!metadataDetail.empty())
             {
-                AddUniqueObjectCacheTarget(targets, ObjectCacheTarget{
-                    vtablePointer,
-                    label,
-                    ComponentMetadataSummary(*state, label),
-                    "mono class-name vtable scan"
-                });
+                AddLog(state, "Mono metadata priority for %s: %s", label.c_str(), metadataDetail.c_str());
+            }
+
+            for (const std::string& resolveLabel : resolveLabels)
+            {
+                std::string classDetail;
+                const std::vector<uintptr_t> classPointers = ResolveMonoClassPointersByName(*state, resolveLabel, &classDetail);
+                AddLog(state, "Mono class scan for %s: %s", resolveLabel.c_str(), classDetail.c_str());
+
+                std::string vtableDetail;
+                const std::vector<uintptr_t> vtablePointers = ResolveMonoVTablePointersByClassPointers(*state, classPointers, &vtableDetail);
+                AddLog(state, "Mono vtable scan for %s: %s", resolveLabel.c_str(), vtableDetail.c_str());
+
+                for (uintptr_t vtablePointer : vtablePointers)
+                {
+                    AddUniqueObjectCacheTarget(targets, ObjectCacheTarget{
+                        vtablePointer,
+                        resolveLabel,
+                        ComponentMetadataSummary(*state, resolveLabel),
+                        "mono class-name vtable scan"
+                    });
+                }
             }
         }
 
@@ -2490,6 +3005,9 @@ namespace Aegis::UnityExternal
             const std::size_t maxResults = static_cast<std::size_t>(std::clamp(state->objectCacheMaxResults, 1, 4096));
             constexpr std::size_t kChunkSize = 1024 * 1024;
             std::size_t positionedCount = 0;
+            const ULONGLONG scanStart = GetTickCount64();
+            const ULONGLONG scanBudget = static_cast<ULONGLONG>(std::clamp(state->objectCacheScanMaxMs, 1000, 300000));
+            bool scanTimedOut = false;
             std::vector<uintptr_t> targetPointers;
             targetPointers.reserve(targets.size());
             for (const ObjectCacheTarget& target : targets)
@@ -2503,6 +3021,12 @@ namespace Aegis::UnityExternal
             while (state->objectCache.size() < maxResults &&
                 VirtualQueryEx(state->reader.ProcessHandle(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi))
             {
+                if (GetTickCount64() - scanStart > scanBudget)
+                {
+                    scanTimedOut = true;
+                    break;
+                }
+
                 const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
                 const uintptr_t next = base + mbi.RegionSize;
                 if (next <= base)
@@ -2516,6 +3040,12 @@ namespace Aegis::UnityExternal
                 {
                     for (uintptr_t chunkBase = base; chunkBase < next && state->objectCache.size() < maxResults;)
                     {
+                        if (GetTickCount64() - scanStart > scanBudget)
+                        {
+                            scanTimedOut = true;
+                            break;
+                        }
+
                         const std::size_t chunkSize = static_cast<std::size_t>(std::min<std::uint64_t>(kChunkSize, next - chunkBase));
                         const std::vector<std::uint8_t> bytes = state->reader.ReadBytes(chunkBase, chunkSize);
                         if (bytes.size() >= sizeof(uintptr_t))
@@ -2582,6 +3112,11 @@ namespace Aegis::UnityExternal
                     }
                 }
 
+                if (scanTimedOut)
+                {
+                    break;
+                }
+
                 address = next;
             }
 
@@ -2611,6 +3146,10 @@ namespace Aegis::UnityExternal
             status << backendName << " cached " << state->objectCache.size()
                 << " live candidate object(s), " << positionedCount
                 << " with readable positions.";
+            if (scanTimedOut)
+            {
+                status << " Scan stopped at " << scanBudget << " ms; raise Object Cache Scan MS for deeper discovery.";
+            }
             state->objectCacheStatus = status.str();
             AddLog(state, "%s", state->objectCacheStatus.c_str());
             const std::size_t loggedTargets = std::min<std::size_t>(targets.size(), 32);
@@ -2772,8 +3311,8 @@ namespace Aegis::UnityExternal
                     : ImVec2(1920.0f, 1080.0f);
                 ImVec2 feet{};
                 ImVec2 head{};
-                if (WorldToScreen(target.position, matrix, state.matrixLayout, screenSize, &feet) &&
-                    WorldToScreen(EntityHeadPosition(target.position, state.upAxis, state.entityHeight), matrix, state.matrixLayout, screenSize, &head))
+                if (WorldToScreen(EntityFeetFromPosition(state, target.position), matrix, state.matrixLayout, screenSize, &feet) &&
+                    WorldToScreen(EntityHeadFromPosition(state, target.position), matrix, state.matrixLayout, screenSize, &head))
                 {
                     score += 25;
                     if (IsOnScreen(feet, screenSize) || IsOnScreen(head, screenSize))
@@ -2979,6 +3518,31 @@ namespace Aegis::UnityExternal
             {
                 const std::optional<uintptr_t> header = state->reader.Read<uintptr_t>(target->objectAddress);
                 objectHeaderMatches = header && *header == target->matchedPointer;
+            }
+
+            const auto absOffset = [](std::int64_t value) -> std::uint64_t {
+                return value < 0
+                    ? static_cast<std::uint64_t>(-value)
+                    : static_cast<std::uint64_t>(value);
+            };
+            const bool positionLooksIndirect =
+                absOffset(target->objectToPositionOffset) > 0x100000 &&
+                (target->cachedPtr == 0 || absOffset(target->cachedPtrToPositionOffset) > 0x100000);
+            if (objectHeaderMatches &&
+                positionLooksIndirect &&
+                state->fastTargetsFallbackToCache &&
+                target->objectAddress != 0)
+            {
+                ObjectCacheEntry fallback;
+                fallback.address = target->objectAddress;
+                fallback.matchedPointer = target->matchedPointer;
+                fallback.label = target->label;
+                fallback.source = "fast-target transform reprobe";
+                if (RefreshObjectCacheEntryPosition(*state, &fallback))
+                {
+                    UpdateFastTargetFromEntry(*state, fallback, target);
+                    return FastTargetReadResult::Fallback;
+                }
             }
 
             uintptr_t directPositionAddress = target->positionAddress;
@@ -3487,15 +4051,17 @@ namespace Aegis::UnityExternal
                         continue;
                     }
 
-                    const float height = std::abs(entity.screen.y - entity.head.y);
+                    const float topY = std::min(entity.head.y, entity.screen.y);
+                    const float bottomY = std::max(entity.head.y, entity.screen.y);
+                    const float height = bottomY - topY;
                     if (height < 2.0f || height > screenSize.y * 2.0f)
                     {
                         continue;
                     }
 
-                    const float width = height * 0.45f;
-                    const ImVec2 topLeft(entity.head.x - width * 0.5f, entity.head.y);
-                    const ImVec2 bottomRight(entity.head.x + width * 0.5f, entity.screen.y);
+                    const float width = height * 0.6f;
+                    const ImVec2 topLeft(entity.screen.x - width * 0.5f, topY);
+                    const ImVec2 bottomRight(entity.screen.x + width * 0.5f, bottomY);
 
                     if (state->espBoxes)
                     {
@@ -4817,7 +5383,11 @@ namespace Aegis::UnityExternal
             ImGui::Combo("Matrix Layout", &state->matrixLayout, matrixLayouts, IM_ARRAYSIZE(matrixLayouts));
             const char* upAxes[] = { "Y Up", "Z Up" };
             ImGui::Combo("Up Axis", &state->upAxis, upAxes, IM_ARRAYSIZE(upAxes));
+            const char* positionAnchors[] = { "Root / Transform", "Feet" };
+            ImGui::Combo("Position Anchor", &state->entityPositionAnchor, positionAnchors, IM_ARRAYSIZE(positionAnchors));
             ImGui::SliderFloat("Entity Height", &state->entityHeight, 0.1f, 4.0f, "%.2f");
+            ImGui::InputFloat("Head Offset", &state->entityHeadOffset, 0.05f, 0.25f, "%.2f");
+            ImGui::InputFloat("Feet Offset", &state->entityFeetOffset, 0.05f, 0.25f, "%.2f");
 
             ImGui::InputTextWithHint("Local Position", "optional Vec3 address for radar center", state->localPositionAddress, sizeof(state->localPositionAddress));
             ImGui::SliderFloat("Radar Range", &state->radarRange, 1.0f, 1000.0f, "%.0f");
@@ -5204,6 +5774,8 @@ namespace Aegis::UnityExternal
             ImGui::Checkbox("Require Readable m_CachedPtr", &state->objectCacheRequireCachedPtr);
             ImGui::Checkbox("Auto Resolve Mono VTables", &state->objectCacheAutoResolveMono);
             ImGui::Checkbox("Auto Resolve IL2CPP Class Pointers", &state->objectCacheAutoResolveIl2Cpp);
+            ImGui::InputInt("Class Scan Budget MS", &state->classScanMaxMs);
+            ImGui::InputInt("Object Cache Scan MS", &state->objectCacheScanMaxMs);
             ImGui::Checkbox("Auto Rebuild Cache", &state->objectCacheAutoRebuild);
             ImGui::SameLine();
             ImGui::InputInt("Rebuild Interval MS", &state->objectCacheAutoRebuildMs);
